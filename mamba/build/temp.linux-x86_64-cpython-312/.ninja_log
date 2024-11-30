@@ -1,0 +1,11 @@
+# ninja log v5
+2	54100	1732701977224368635	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_fwd_fp16.o	6c1d61061f0f66a6
+2	55512	1732701978644365364	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_fwd_fp32.o	c04bd592c94a7559
+0	55595	1732701978734365157	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan.o	437d75deed0a84c7
+1	57692	1732701980824360341	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_fwd_bf16.o	e207ee013d8bc9ce
+1	93971	1732702006530502280	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_fp32_real.o	12144c3b8217338e
+0	85526	1732702008666176666	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_fp16_real.o	f5319987cb77dabb
+0	89936	1732702013077347051	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_bf16_real.o	17da903488a23bfd
+0	107373	1732702030494146538	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_fp16_complex.o	bd1c71cb77c77e96
+1	107406	1732702030524146467	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_fp32_complex.o	7ba588544019cda3
+0	109541	1732702032657608016	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/mamba/build/temp.linux-x86_64-cpython-312/csrc/selective_scan/selective_scan_bwd_bf16_complex.o	b14db22a66a2690b

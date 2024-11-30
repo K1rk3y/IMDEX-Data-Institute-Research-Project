@@ -1,0 +1,5 @@
+# ninja log v5
+0	3043	1732701907471354907	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/causal-conv1d/build/temp.linux-x86_64-cpython-312/csrc/causal_conv1d_update.o	4ca8d558d1407e21
+0	6172	1732701910591347722	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/causal-conv1d/build/temp.linux-x86_64-cpython-312/csrc/causal_conv1d_fwd.o	7186b470dcd29fba
+0	4350	1732701908760879363	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/causal-conv1d/build/temp.linux-x86_64-cpython-312/csrc/causal_conv1d_bwd.o	3010eb43f060729c
+0	8412	1732701912827895849	/home/kirkey/IMDEX-Data-Institute/IMDEX-Data-Institute-Research-Project/causal-conv1d/build/temp.linux-x86_64-cpython-312/csrc/causal_conv1d.o	57475ed40108c926
