@@ -2,4 +2,6 @@
 poetry.lock
 models
 models/videomamba_m16_in1k_res224.pth
+checkpoints
 mamba/selective_scan_cuda.cpython-312-x86_64-linux-gnu.so
+kinetics_dataset
