@@ -45,6 +45,7 @@ wheel = "*"
 xformers = "*"
 jupyter = "*"
 ipykernel = "*"
+matplotlib = "^3.9.3"
 
 [build-system]
 requires = ["poetry-core"]
