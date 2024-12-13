@@ -128,6 +128,8 @@ class MCFSDataSet(data.Dataset):
             if self.is_mirror and random.random() < 0.5:
                 image = np.fliplr(image).copy()  # Use copy() to ensure contiguous array
                 label = np.fliplr(label).copy()
+
+        image = image.transpose((2, 0, 1))  # HWC -> CHW
         
         # Ensure arrays are contiguous
         image = np.ascontiguousarray(image)
