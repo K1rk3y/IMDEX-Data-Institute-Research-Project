@@ -46,6 +46,7 @@ xformers = "*"
 jupyter = "*"
 ipykernel = "*"
 matplotlib = "^3.9.3"
+kornia = "^0.7.4"
 
 [build-system]
 requires = ["poetry-core"]

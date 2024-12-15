@@ -140,11 +140,3 @@ class MCFSDataSet(data.Dataset):
                 np.array(size),
                 name,
                 index)
-    
-
-dataset = MCFSDataSet(
-    root="mcfs_dataset",
-    split="train",
-    ignore_label=255
-)
-print(len(dataset))
