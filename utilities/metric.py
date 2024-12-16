@@ -81,12 +81,7 @@ def get_iou(data_list, class_num, save_path=None):
 
     aveJ, j_list, M = ConfM.jaccard()
 
-    classes = np.array(('background',  # always index 0
-               'aeroplane', 'bicycle', 'bird', 'boat',
-               'bottle', 'bus', 'car', 'cat', 'chair',
-                         'cow', 'diningtable', 'dog', 'horse',
-                         'motorbike', 'person', 'pottedplant',
-                         'sheep', 'sofa', 'train', 'tvmonitor'))
+    classes = np.array(('background', 'face', 'nose', 'upper_lip', 'under_lip', 'hair', 'left_eyebrow', 'right_eyebrow', 'right_eye', 'left_eye', 'tongue', 'right_ear', 'left_ear', 'glasses', 'headdress', 'head', 'left_eyelashes', 'right_eyelashes'))
 
     for i, iou in enumerate(j_list):
         print('class {:2d} {:12} IU {:.2f}'.format(i, classes[i], j_list[i]))

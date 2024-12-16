@@ -8,7 +8,7 @@ from torch.utils import data
 
 class MCFSDataSet(data.Dataset):
     def __init__(self, root, split="train", max_iters=None, crop_size=(321, 321), 
-                 scale=True, mirror=True, ignore_label=255):
+                 scale=True, mirror=True, ignore_label=255, pretraining='COCO'):
         """
         Args:
             root (str): Path to content/All_data directory
@@ -25,6 +25,7 @@ class MCFSDataSet(data.Dataset):
         self.ignore_label = ignore_label
         self.is_mirror = mirror
         self.split = split
+        self.pretraining = pretraining
 
         # Setup paths based on split
         split_dir = osp.join(self.root, split)
@@ -84,7 +85,10 @@ class MCFSDataSet(data.Dataset):
             raise ValueError(f"Failed to load label: {datafiles['label']}")
         
         # Convert BGR to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.pretraining == 'COCO': # if pratraining is not COCO, change to RGB
+            image = image
+        else:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         size = image.shape
         name = datafiles["name"]
         
