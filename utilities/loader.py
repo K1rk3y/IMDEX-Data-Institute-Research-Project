@@ -126,7 +126,7 @@ class SeqToImagesProcessor:
         # Check if this is a multiple sample case
         if isinstance(celebdf_output[0], list):
             # Multiple samples case
-            frame_list, label_list, index_list, metadata = celebdf_output
+            frame_list = celebdf_output
             
             # Process each sample's frames
             processed_samples = []
@@ -134,13 +134,13 @@ class SeqToImagesProcessor:
                 processed_frames = self._process_single_buffer(frames)
                 processed_samples.append(processed_frames)
             
-            return processed_samples, label_list, index_list, metadata
+            return processed_samples
         else:
             # Single sample case
-            buffer, label, index, metadata = celebdf_output
+            buffer = celebdf_output
             processed_frames = self._process_single_buffer(buffer)
             
-            return processed_frames, label, index, metadata
+            return processed_frames
     
 
 class ImagesToSeqProcessor:

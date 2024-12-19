@@ -9,6 +9,9 @@ from decord import VideoReader, cpu
 from torch.utils.data import Dataset
 from .random_erasing import RandomErasing
 from .volume_transforms import ClipToTensor
+from .loader import SeqToImagesProcessor, ImagesToSeqProcessor
+from torch.autograd import Variable
+from torch.utils import data, model_zoo
 
 from .video_transforms import (
     Compose, Resize, CenterCrop, Normalize,
@@ -24,7 +27,7 @@ class CelebDFDataSet(Dataset):
                  frame_sample_rate=2, crop_size=224, short_side_size=256,
                  new_height=256, new_width=340, keep_aspect_ratio=True,
                  num_segment=1, num_crop=1, test_num_segment=10, test_num_crop=3,
-                 args=None):
+                 semantic_loading=False, model=None, normalize=None, args=None):
         
         self.root_path = root_path
         self.test_list_path = test_list_path
@@ -43,6 +46,11 @@ class CelebDFDataSet(Dataset):
         self.args = args
         self.aug = False
         self.rand_erase = False
+        self.semantic_loading = semantic_loading
+
+        if self.semantic_loading:
+            self.model = model
+            self.normalize = normalize
         
         assert num_segment == 1
         if self.mode in ['train']:
@@ -168,6 +176,51 @@ class CelebDFDataSet(Dataset):
                 return frame_list, label_list, index_list, {}
             else:
                 buffer = self._aug_frame(buffer, args)
+         
+            if self.semantic_loading:
+                sip = SeqToImagesProcessor(crop_size=(args.crop_size, args.crop_size), scale=True, mirror=True, pretraining='COCO')
+
+                processed_samples = sip.process_celebdf_output(buffer)
+                    
+                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
+
+                mappings = []
+                    
+                for index, batch in enumerate(testloader):
+                    image = batch
+                        
+                    with torch.no_grad():
+                        # Get model prediction
+                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
+                        #print("SHAPE:", image.shape[2], image.shape[3])
+                        output = self.model(self.normalize(Variable(image).cuda(), None))
+                        output = interp(output)
+                        #print("IMAGE SHAPE:", image.size())
+                        #print(output.size())
+                            
+                        # Convert output to numpy array and get class predictions
+                        output = output.cpu().data[0].numpy()
+                        prediction = np.argmax(output, axis=0)
+                            
+                        # Create coordinate mapping for each class
+                        class_coordinates = {}
+                        height, width = prediction.shape
+                            
+                        # Iterate through the prediction mask to collect coordinates
+                        for y in range(height):
+                            for x in range(width):
+                                class_id = int(prediction[y, x])
+                                if class_id not in class_coordinates:
+                                    class_coordinates[class_id] = []
+                                class_coordinates[class_id].append((x, y))
+                            
+                        # Store results for this image
+                        mappings.append(class_coordinates)
+                        
+                    if (index + 1) % args.clip_len == 0:
+                        print(f'Processed {index + 1} images')
+
+                return buffer, self.label_array[index], index, {}, mappings
             
             return buffer, self.label_array[index], index, {}
 
