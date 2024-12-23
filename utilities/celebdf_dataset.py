@@ -234,6 +234,49 @@ class CelebDFDataSet(Dataset):
                     sample = self.dataset_samples[index]
                     buffer = self.loadvideo_decord(sample)
             buffer = self.data_transform(buffer)
+
+            if self.semantic_loading:
+                sip = SeqToImagesProcessor(crop_size=(self.crop_size, self.crop_size), scale=True, mirror=True, pretraining='COCO')     # SELF CROP INSTEAD OF ARGS CROP
+
+                processed_samples = sip.process_celebdf_output(buffer)
+                    
+                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
+
+                mappings = []
+                    
+                for index, batch in enumerate(testloader):
+                    image = batch
+                        
+                    with torch.no_grad():
+                        # Get model prediction
+                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
+                        #print("SHAPE:", image.shape[2], image.shape[3])
+                        output = self.model(self.normalize(Variable(image).cuda(), None))
+                        output = interp(output)
+                        #print("IMAGE SHAPE:", image.size())
+                        #print(output.size())
+                            
+                        # Convert output to numpy array and get class predictions
+                        output = output.cpu().data[0].numpy()
+                        prediction = np.argmax(output, axis=0)
+                            
+                        # Create coordinate mapping for each class
+                        class_coordinates = {}
+                        height, width = prediction.shape
+                            
+                        # Iterate through the prediction mask to collect coordinates
+                        for y in range(height):
+                            for x in range(width):
+                                class_id = int(prediction[y, x])
+                                if class_id not in class_coordinates:
+                                    class_coordinates[class_id] = []
+                                class_coordinates[class_id].append((x, y))
+                            
+                        # Store results for this image
+                        mappings.append(class_coordinates)                     
+
+                return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0], mappings
+
             return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
 
         elif self.mode == 'test':
@@ -266,6 +309,50 @@ class CelebDFDataSet(Dataset):
                 buffer = buffer[:, :, spatial_start:spatial_start + self.short_side_size, :]
 
             buffer = self.data_transform(buffer)
+
+            if self.semantic_loading:
+                sip = SeqToImagesProcessor(crop_size=(self.crop_size, self.crop_size), scale=True, mirror=True, pretraining='COCO')     # SELF CROP INSTEAD OF ARGS CROP
+
+                processed_samples = sip.process_celebdf_output(buffer)
+                    
+                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
+
+                mappings = []
+                    
+                for index, batch in enumerate(testloader):
+                    image = batch
+                        
+                    with torch.no_grad():
+                        # Get model prediction
+                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
+                        #print("SHAPE:", image.shape[2], image.shape[3])
+                        output = self.model(self.normalize(Variable(image).cuda(), None))
+                        output = interp(output)
+                        #print("IMAGE SHAPE:", image.size())
+                        #print(output.size())
+                            
+                        # Convert output to numpy array and get class predictions
+                        output = output.cpu().data[0].numpy()
+                        prediction = np.argmax(output, axis=0)
+                            
+                        # Create coordinate mapping for each class
+                        class_coordinates = {}
+                        height, width = prediction.shape
+                            
+                        # Iterate through the prediction mask to collect coordinates
+                        for y in range(height):
+                            for x in range(width):
+                                class_id = int(prediction[y, x])
+                                if class_id not in class_coordinates:
+                                    class_coordinates[class_id] = []
+                                class_coordinates[class_id].append((x, y))
+                            
+                        # Store results for this image
+                        mappings.append(class_coordinates)                     
+
+                return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
+                        chunk_nb, split_nb, mappings
+
             return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
                    chunk_nb, split_nb
 
