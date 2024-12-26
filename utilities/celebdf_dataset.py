@@ -24,8 +24,8 @@ class CelebDFDataSet(Dataset):
     """Load the Celeb-DF dataset for deepfake detection."""
 
     def __init__(self, root_path, test_list_path=None, mode='train', clip_len=8,
-                 frame_sample_rate=2, crop_size=224, short_side_size=256,
-                 new_height=256, new_width=340, keep_aspect_ratio=True,
+                 frame_sample_rate=2, crop_size=224, short_side_size=224,
+                 new_height=224, new_width=224, keep_aspect_ratio=True,
                  num_segment=1, num_crop=1, test_num_segment=10, test_num_crop=3,
                  semantic_loading=False, model=None, normalize=None, args=None):
         
@@ -217,7 +217,7 @@ class CelebDFDataSet(Dataset):
                         # Store results for this image
                         mappings.append(class_coordinates)
                         
-                    if (index + 1) % args.clip_len == 0:
+                    if (index + 1) % self.clip_len == 0:
                         print(f'Processed {index + 1} images')
 
                 return buffer, self.label_array[index], index, {}, mappings

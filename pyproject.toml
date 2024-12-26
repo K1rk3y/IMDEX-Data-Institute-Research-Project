@@ -37,7 +37,6 @@ torch = "*"
 torchvision = "*"
 torchaudio = "*"
 termcolor = "*"
-timm = "*"
 tqdm = "*"
 transformers = "*"
 wandb = "*"
@@ -47,6 +46,7 @@ jupyter = "*"
 ipykernel = "*"
 matplotlib = "^3.9.3"
 kornia = "^0.7.4"
+timm = "0.4.12"
 
 [build-system]
 requires = ["poetry-core"]

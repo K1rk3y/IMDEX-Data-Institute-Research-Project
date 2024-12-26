@@ -14,7 +14,7 @@ import numbers
 import PIL
 import torchvision
 
-import torch.nn.functional as FF
+import utilities.functional as FF
 
 _pil_interpolation_to_str = {
     Image.NEAREST: "PIL.Image.NEAREST",
