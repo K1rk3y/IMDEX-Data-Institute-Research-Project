@@ -14,6 +14,7 @@ from scipy.special import softmax
 
 def train_class_batch(model, samples, target, criterion):
     outputs = model(samples)
+    print("MODEL OPT: ", outputs, " TARGET: ", target)
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -300,7 +301,7 @@ def train_one_epoch_no_dist(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def validation_one_epoch_no_dist(data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
+def validation_one_epoch(data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -341,7 +342,7 @@ def validation_one_epoch_no_dist(data_loader, model, device, amp_autocast, ds=Tr
 
 
 @torch.no_grad()
-def validation_one_epoch(data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
+def validation_one_epoch_no_dist(data_loader, model, device, amp_autocast, ds=True, no_amp=False, bf16=False, maxk=5):
     criterion = torch.nn.CrossEntropyLoss()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Val:'

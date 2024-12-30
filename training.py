@@ -5,6 +5,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
+import gc
 from functools import partial
 from pathlib import Path
 from collections import OrderedDict
@@ -22,6 +23,7 @@ from utils import multiple_samples_collate
 import utils
 import contextlib
 import argparse
+import copy
 
 from torch.utils import model_zoo
 from utilities.celebdf_dataset import CelebDFDataSet
@@ -741,6 +743,333 @@ def class_pixel_loader(args, mode):
     return test_dataset
 
 
+def freeze_layers(model, num_layers_to_freeze=None):
+    """
+    Freeze layers of the model starting from the bottom
+    Args:
+        model: The model to freeze
+        num_layers_to_freeze: Number of layers to freeze from bottom. If None, freeze all except head
+    """
+    # First, freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Get model type and determine architecture
+    if 'videomamba' in model.__class__.__name__.lower():
+        blocks = model.blocks if hasattr(model, 'blocks') else []
+        total_layers = len(blocks)
+    elif hasattr(model, 'get_num_layers'):
+        total_layers = model.get_num_layers()
+    else:
+        raise ValueError("Unknown model architecture - cannot determine number of layers")
+
+    # Validate num_layers_to_freeze
+    if num_layers_to_freeze is not None:
+        if not isinstance(num_layers_to_freeze, int) or num_layers_to_freeze < 0:
+            raise ValueError("num_layers_to_freeze must be a non-negative integer")
+        if num_layers_to_freeze > total_layers:
+            print(f"Warning: num_layers_to_freeze ({num_layers_to_freeze}) is greater than total layers ({total_layers})")
+            num_layers_to_freeze = total_layers
+
+    # For Stage 1 (num_layers_to_freeze is None), keep everything frozen except head
+    if num_layers_to_freeze is None:
+        # Only unfreeze head
+        if hasattr(model, 'head'):
+            for param in model.head.parameters():
+                param.requires_grad = True
+        print("Stage 1: Froze all layers except head")
+        return
+
+    # For other stages, unfreeze layers from top to bottom
+    frozen_layers = set()
+    unfrozen_layers = set()
+    
+    for name, param in model.named_parameters():
+        # Always unfreeze head
+        if 'head' in name:
+            param.requires_grad = True
+            continue
+            
+        # Keep patch embedding frozen for all stages
+        if any(x in name for x in ['patch_embed', 'pos_embed', 'cls_token']):
+            param.requires_grad = False
+            frozen_layers.add('embedding')
+            continue
+
+        # Handle different model architectures
+        layer_num = None
+        if 'videomamba' in model.__class__.__name__.lower():
+            if 'blocks.' in name:
+                layer_num = int(name.split('blocks.')[1].split('.')[0])
+        elif 'deit' in model.__class__.__name__.lower() or 'vit' in model.__class__.__name__.lower():
+            if 'block.' in name:
+                layer_num = int(name.split('block.')[1].split('.')[0])
+        else:
+            if name.split('.')[0] in ['blocks', 'block']:
+                layer_num = int(name.split('.')[1])
+
+        if layer_num is not None:
+            if layer_num < num_layers_to_freeze:
+                param.requires_grad = False
+                frozen_layers.add(layer_num)
+            else:
+                param.requires_grad = True
+                unfrozen_layers.add(layer_num)
+
+    print(f"Frozen layers: {sorted(frozen_layers)}")
+    print(f"Unfrozen layers: {sorted(unfrozen_layers)}")
+    print(f"Total frozen layers: {len(frozen_layers)}")
+    print(f"Total unfrozen layers: {len(unfrozen_layers)}")
+
+
+def verify_layer_freezing(model):
+    """
+    Verify which layers are frozen/unfrozen
+    """
+    frozen = []
+    unfrozen = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            unfrozen.append(name)
+        else:
+            frozen.append(name)
+            
+    print("\nFrozen parameters:")
+    for name in frozen:
+        print(f"  {name}")
+    print("\nUnfrozen parameters:")
+    for name in unfrozen:
+        print(f"  {name}")
+    
+    return len(frozen), len(unfrozen)
+
+
+def get_stage_config(stage, args):
+    """
+    Get configuration for different training stages
+    Args:
+        stage: Training stage (1, 2, or 3)
+        args: Original training arguments
+    Returns:
+        Modified configuration for the stage
+    """
+    if stage not in [1, 2, 3]:
+        raise ValueError("Stage must be 1, 2, or 3")
+        
+    config = copy.deepcopy(args)
+    
+    # Stage-specific configurations
+    stage_configs = {
+        1: {  # Feature extraction
+            'epochs': min(5, args.epochs),
+            'lr_factor': 0.1,
+            'layer_decay': 1.0,
+            'weight_decay_factor': 0.1,
+            'frozen_layers': None  # Freeze all except head
+        },
+        2: {  # Partial fine-tuning
+            'epochs': min(10, args.epochs),
+            'lr_factor': 0.5,
+            'layer_decay': args.layer_decay,
+            'weight_decay_factor': 1.0,
+            'frozen_layers': args.num_layers // 2 if hasattr(args, 'num_layers') else 6
+        },
+        3: {  # Full fine-tuning
+            'epochs': args.epochs,
+            'lr_factor': 1.0,
+            'layer_decay': args.layer_decay,
+            'weight_decay_factor': 1.0,
+            'frozen_layers': 0
+        }
+    }
+    
+    stage_config = stage_configs[stage]
+    
+    # Apply configurations
+    config.epochs = stage_config['epochs']
+    config.lr = args.lr * stage_config['lr_factor']
+    config.layer_decay = stage_config['layer_decay']
+    config.weight_decay = args.weight_decay * stage_config['weight_decay_factor']
+    config.frozen_layers = stage_config['frozen_layers']
+    
+    # Adjust warmup for each stage
+    config.warmup_epochs = max(1, args.warmup_epochs // (4-stage))
+    
+    return config
+
+
+def reset_optimizer_and_scheduler(model, stage_config, num_steps_per_epoch, assigner=None):
+    """
+    Create fresh optimizer and scheduler for each stage
+    """
+    optimizer = create_optimizer(
+        stage_config, model,
+        skip_list=model.no_weight_decay() if hasattr(model, 'no_weight_decay') else [],
+        get_num_layer=assigner.get_layer_id if assigner is not None else None,
+        get_layer_scale=assigner.get_scale if assigner is not None else None
+    )
+    
+    lr_schedule = utils.cosine_scheduler(
+        stage_config.lr, 
+        stage_config.min_lr, 
+        stage_config.epochs,
+        num_steps_per_epoch,
+        warmup_epochs=stage_config.warmup_epochs,
+        start_warmup_value=stage_config.warmup_lr
+    )
+    
+    return optimizer, lr_schedule
+
+
+def cleanup_stage(model_ema=None):
+    """
+    Cleanup resources after each stage
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    if model_ema is not None:
+        model_ema.restore_backup()
+        
+    gc.collect()
+
+
+def staged_training(model, args, data_loaders, device, criterion, amp_autocast, mixup_fn=None, 
+                   assigner=None, model_ema=None, loss_scaler=None, log_writer=None):
+    """
+    Enhanced staged training with proper error handling and resource management
+    """
+    if not all(k in data_loaders for k in ['train', 'val', 'test']):
+        raise ValueError("data_loaders must contain 'train', 'val', and 'test' keys")
+    
+    training_stats = []
+    global_best_acc = 0.0
+    
+    try:
+        for stage in range(1, 4):
+            print(f"\n{'='*20} Starting Stage {stage} {'='*20}")
+            stage_config = get_stage_config(stage, args)
+            
+            # Apply layer freezing with verification
+            freeze_layers(model, stage_config.frozen_layers)
+            frozen_count, unfrozen_count = verify_layer_freezing(model)
+            print(f"Stage {stage}: {frozen_count} frozen parameters, {unfrozen_count} unfrozen parameters")
+
+            total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
+            num_training_steps_per_epoch = len(data_loaders['train'].dataset) // total_batch_size
+            print("STEPS PER EPOCH: ", num_training_steps_per_epoch)
+            
+            # Reset optimizer and scheduler for new stage
+            optimizer, lr_schedule = reset_optimizer_and_scheduler(model, stage_config, num_training_steps_per_epoch, assigner)
+            
+            # Initialize early stopping
+            patience = max(2, stage_config.epochs // 10)  # 10% of stage epochs
+            best_acc = 0.0
+            patience_counter = 0
+            
+            stage_stats = {'stage': stage, 'epochs': [], 'best_acc': 0.0}
+            
+            for epoch in range(stage_config.epochs):
+                if args.distributed:
+                    data_loaders['train'].sampler.set_epoch(epoch)
+                    torch.distributed.barrier()
+                
+                # Clear gradients before training
+                model.zero_grad()
+                if model_ema is not None:
+                    model_ema.zero_grad()
+                
+                try:
+                    # Training
+                    if args.distributed:
+                        train_stats = train_one_epoch(
+                            model, criterion, data_loaders['train'], optimizer,
+                            device, epoch, loss_scaler, amp_autocast, stage_config.clip_grad,
+                            model_ema=model_ema, mixup_fn=mixup_fn,
+                            log_writer=log_writer, start_steps=epoch * len(data_loaders['train']),
+                            lr_schedule_values=lr_schedule,
+                            num_training_steps_per_epoch=num_training_steps_per_epoch,
+                            update_freq=stage_config.update_freq,
+                            no_amp=args.no_amp,
+                            bf16=args.bf16
+                        )
+                    else:
+                        train_stats = train_one_epoch_no_dist(
+                            model, criterion, data_loaders['train'], optimizer,
+                            device, epoch, loss_scaler, amp_autocast, stage_config.clip_grad,
+                            model_ema=model_ema, mixup_fn=mixup_fn,
+                            log_writer=log_writer, start_steps=epoch * len(data_loaders['train']),
+                            lr_schedule_values=lr_schedule,
+                            num_training_steps_per_epoch=num_training_steps_per_epoch,
+                            update_freq=stage_config.update_freq,
+                            no_amp=args.no_amp,
+                            bf16=args.bf16
+                        )
+                        
+                    # Validation
+                    if data_loaders['val'] is not None:
+                        test_stats = validation_one_epoch(
+                            data_loaders['val'], model, device, amp_autocast,
+                            ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
+                            maxk=5 if args.nb_classes >= 5 else 1
+                        )
+                        
+                        if args.distributed:
+                            torch.distributed.barrier()
+                            # Gather accuracy from all processes
+                            acc1_tensor = torch.tensor(test_stats['acc1']).cuda()
+                            torch.distributed.all_reduce(acc1_tensor)
+                            test_stats['acc1'] = acc1_tensor.item() / torch.distributed.get_world_size()
+                        
+                        # Update best accuracy and save checkpoint
+                        is_best = test_stats['acc1'] > best_acc
+                        if is_best:
+                            best_acc = test_stats['acc1']
+                            stage_stats['best_acc'] = best_acc
+                            patience_counter = 0
+                            if best_acc > global_best_acc:
+                                global_best_acc = best_acc
+                        else:
+                            patience_counter += 1
+                        
+                        # Early stopping check
+                        if patience_counter >= patience:
+                            print(f"Early stopping triggered at epoch {epoch}")
+                            break
+                    
+                except RuntimeError as e:
+                    print(f"Error during epoch: {str(e)}")
+                    if "out of memory" in str(e):
+                        cleanup_stage(model_ema)
+                    raise e
+                
+                # Log statistics
+                if not args.distributed or utils.is_main_process():
+                    epoch_stats = {
+                        'epoch': epoch,
+                        'train_loss': train_stats['loss'],
+                        'val_acc1': test_stats['acc1'] if data_loaders['val'] is not None else None,
+                        'lr': optimizer.param_groups[0]['lr']
+                    }
+                    stage_stats['epochs'].append(epoch_stats)
+                    
+                    print(f"Stage {stage}, Epoch {epoch}: "
+                          f"train_loss: {train_stats['loss']:.3f}, "
+                          f"val_acc1: {test_stats['acc1']:.2f}% "
+                          f"lr: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            # Cleanup after stage
+            cleanup_stage(model_ema)
+            training_stats.append(stage_stats)
+            
+        return training_stats, global_best_acc
+        
+    except Exception as e:
+        print(f"Error during staged training: {str(e)}")
+        cleanup_stage(model_ema)
+        raise
+
+
 def main(args, ds_init):
     utils.init_distributed_mode(args)
 
@@ -1096,11 +1425,12 @@ def main(args, ds_init):
             amp_autocast = torch.cuda.amp.autocast(dtype=dtype)
             loss_scaler = NativeScaler()
 
-    print("Use step level LR scheduler!")
+    """print("Use step level LR scheduler!")
     lr_schedule_values = utils.cosine_scheduler(
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, start_warmup_value=args.warmup_lr, warmup_steps=args.warmup_steps,
-    )
+    )"""
+
     if args.weight_decay_end is None:
         args.weight_decay_end = args.weight_decay
     wd_schedule_values = utils.cosine_scheduler(
@@ -1110,10 +1440,13 @@ def main(args, ds_init):
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
+        print("Using SoftTargetCrossEntropy")
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        print("Using LabelSmoothingCrossEntropy")
     else:
         criterion = torch.nn.CrossEntropyLoss()
+        print("Using CrossEntropyLoss")
 
     print("criterion = %s" % str(criterion))
 
@@ -1154,81 +1487,48 @@ def main(args, ds_init):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
 
-        if args.distributed:
-            train_stats = train_one_epoch(
-                model, criterion, data_loader_train, optimizer,
-                device, epoch, loss_scaler, amp_autocast, args.clip_grad, model_ema, mixup_fn,
-                log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
-                lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-                num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-                no_amp=args.no_amp, bf16=args.bf16
+    if not args.eval:
+        data_loaders = {
+            'train': data_loader_train,
+            'val': data_loader_val,
+            'test': data_loader_test
+        }
+        
+        try:
+            stats, best_accuracy = staged_training(
+                model=model,
+                args=args,
+                data_loaders=data_loaders,
+                device=device,
+                criterion=criterion,
+                amp_autocast=amp_autocast,
+                mixup_fn=mixup_fn,
+                assigner=assigner,
+                model_ema=model_ema,
+                loss_scaler=loss_scaler,
+                log_writer=log_writer
             )
-        else:
-            train_stats = train_one_epoch_no_dist(
-                model, criterion, data_loader_train, optimizer,
-                device, epoch, loss_scaler, amp_autocast, args.clip_grad, model_ema, mixup_fn,
-                log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
-                lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-                num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-                no_amp=args.no_amp, bf16=args.bf16
-            )
+            
+            if max_accuracy < best_accuracy:
+                max_accuracy = best_accuracy
+            
+            # Save and log final results
+            if args.output_dir and (not args.distributed or utils.is_main_process()):
+                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                    for stage_stat in stats:
+                        f.write(json.dumps(stage_stat) + "\n")
+                    f.write(json.dumps({'final_best_accuracy': best_accuracy}) + "\n")
+                
+                if log_writer is not None:
+                    log_writer.flush()
+        
+        except Exception as e:
+            print(f"Training failed: {str(e)}")
+            raise
 
-        if args.output_dir and args.save_ckpt:
-            # if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
-            #     utils.save_model(
-            #         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-            #         loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
-            utils.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, model_name='latest', model_ema=model_ema)
-        if data_loader_val is not None:
-            if args.distributed:
-                test_stats = validation_one_epoch(
-                    data_loader_val, model, device, amp_autocast,
-                    ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
-                    maxk=5 if args.nb_classes >= 5 else 1
-                )
-            else:
-                test_stats = validation_one_epoch_no_dist(
-                    data_loader_val, model, device, amp_autocast,
-                    ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
-                    maxk=5 if args.nb_classes >= 5 else 1
-                )
-            timestep = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"[{timestep}] Accuracy of the network on the {len(dataset_val)} val videos: {test_stats['acc1']:.1f}%")
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
-                if args.output_dir and args.save_ckpt:
-                    utils.save_model(
-                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                        loss_scaler=loss_scaler, epoch=epoch, model_name='best', model_ema=model_ema)
-
-            print(f'Max accuracy: {max_accuracy:.2f}%')
-            if log_writer is not None:
-                log_writer.update(val_acc1=test_stats['acc1'], head="perf", step=epoch)
-                log_writer.update(val_acc5=test_stats['acc5'], head="perf", step=epoch)
-                log_writer.update(val_loss=test_stats['loss'], head="perf", step=epoch)
-
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'val_{k}': v for k, v in test_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
-        else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
-        if args.output_dir and utils.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
+    
+    print("MAX ACCURACY: ", max_accuracy)
     preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
     if args.test_best:
         print("Auto testing the best model")

@@ -4,7 +4,7 @@ export OMP_NUM_THREADS=1
 JOB_NAME='videomamba_middle_f16_res224'
 OUTPUT_DIR="./checkpoints/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
-DATA_PATH='celebdf_dataset_slim'
+DATA_PATH='celebdf_dataset'
 
 # Direct execution instead of using srun
 python training.py \
@@ -23,7 +23,7 @@ python training.py \
     --num_workers 8 \
     --warmup_epochs 5 \
     --tubelet_size 1 \
-    --epochs 5 \
+    --epochs 20 \
     --lr 1e-4 \
     --drop_path 0.8 \
     --opt adamw \
