@@ -12,6 +12,7 @@ from .volume_transforms import ClipToTensor
 from .loader import SeqToImagesProcessor, ImagesToSeqProcessor
 from torch.autograd import Variable
 from torch.utils import data, model_zoo
+import torch.multiprocessing as mp
 
 from .video_transforms import (
     Compose, Resize, CenterCrop, Normalize,
@@ -19,6 +20,13 @@ from .video_transforms import (
     random_crop, random_resized_crop_with_shift, random_resized_crop,
     horizontal_flip, random_short_side_scale_jitter, uniform_crop, 
 )
+
+if __name__ == '__main__':
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
+
 
 class CelebDFDataSet(Dataset):
     """Load the Celeb-DF dataset for deepfake detection."""
@@ -49,8 +57,9 @@ class CelebDFDataSet(Dataset):
         self.semantic_loading = semantic_loading
 
         if self.semantic_loading:
-            self.model = model
             self.normalize = normalize
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model = model.to(self.device)
         
         assert num_segment == 1
         if self.mode in ['train']:
@@ -181,18 +190,16 @@ class CelebDFDataSet(Dataset):
                 sip = SeqToImagesProcessor(crop_size=(args.crop_size, args.crop_size), scale=True, mirror=True, pretraining='COCO')
 
                 processed_samples = sip.process_celebdf_output(buffer)
-                    
-                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
-
+        
                 mappings = []
                     
-                for index, batch in enumerate(testloader):
-                    image = batch
+                for index, batch in enumerate(processed_samples):
+                    image = batch.to(self.device)
                         
                     with torch.no_grad():
                         # Get model prediction
-                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
-                        #print("SHAPE:", image.shape[2], image.shape[3])
+                        interp = torch.nn.Upsample(size=(image.shape[1], image.shape[2]), mode='bilinear', align_corners=True).to(self.device)
+                        # print("IMG SHAPE:", image.shape[1], image.shape[2])
                         output = self.model(self.normalize(Variable(image).cuda(), None))
                         output = interp(output)
                         #print("IMAGE SHAPE:", image.size())
@@ -216,11 +223,8 @@ class CelebDFDataSet(Dataset):
                             
                         # Store results for this image
                         mappings.append(class_coordinates)
-                        
-                    if (index + 1) % self.clip_len == 0:
-                        print(f'Processed {index + 1} images')
 
-                return buffer, self.label_array[index], index, {}, mappings
+                return buffer, self.label_array[index], index, mappings
             
             return buffer, self.label_array[index], index, {}
 
@@ -238,18 +242,16 @@ class CelebDFDataSet(Dataset):
             if self.semantic_loading:
                 sip = SeqToImagesProcessor(crop_size=(self.crop_size, self.crop_size), scale=True, mirror=True, pretraining='COCO')     # SELF CROP INSTEAD OF ARGS CROP
 
-                processed_samples = sip.process_celebdf_output(buffer)
-                    
-                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
+                processed_samples = sip.process_celebdf_output(buffer)            
 
                 mappings = []
                     
-                for index, batch in enumerate(testloader):
-                    image = batch
+                for index, batch in enumerate(processed_samples):
+                    image = batch.to(self.device)
                         
                     with torch.no_grad():
                         # Get model prediction
-                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
+                        interp = torch.nn.Upsample(size=(image.shape[1], image.shape[2]), mode='bilinear', align_corners=True).to(self.device)
                         #print("SHAPE:", image.shape[2], image.shape[3])
                         output = self.model(self.normalize(Variable(image).cuda(), None))
                         output = interp(output)
@@ -277,7 +279,7 @@ class CelebDFDataSet(Dataset):
 
                 return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0], mappings
 
-            return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
+            return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0], {}
 
         elif self.mode == 'test':
             sample = self.test_dataset[index]
@@ -314,17 +316,15 @@ class CelebDFDataSet(Dataset):
                 sip = SeqToImagesProcessor(crop_size=(self.crop_size, self.crop_size), scale=True, mirror=True, pretraining='COCO')     # SELF CROP INSTEAD OF ARGS CROP
 
                 processed_samples = sip.process_celebdf_output(buffer)
-                    
-                testloader = data.DataLoader(processed_samples, batch_size=1, shuffle=False, pin_memory=True)
 
                 mappings = []
                     
-                for index, batch in enumerate(testloader):
-                    image = batch
+                for index, batch in enumerate(processed_samples):
+                    image = batch.to(self.device)
                         
                     with torch.no_grad():
                         # Get model prediction
-                        interp = torch.nn.Upsample(size=(image.shape[2], image.shape[3]), mode='bilinear', align_corners=True)
+                        interp = torch.nn.Upsample(size=(image.shape[1], image.shape[2]), mode='bilinear', align_corners=True).to(self.device)
                         #print("SHAPE:", image.shape[2], image.shape[3])
                         output = self.model(self.normalize(Variable(image).cuda(), None))
                         output = interp(output)
@@ -354,7 +354,7 @@ class CelebDFDataSet(Dataset):
                         chunk_nb, split_nb, mappings
 
             return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
-                   chunk_nb, split_nb
+                   chunk_nb, split_nb, {}
 
         else:
             raise NameError('mode {} unknown'.format(self.mode))

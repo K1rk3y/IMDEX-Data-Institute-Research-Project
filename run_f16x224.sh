@@ -23,6 +23,10 @@ python training.py \
     --num_workers 8 \
     --warmup_epochs 5 \
     --tubelet_size 1 \
+    --mixup 0.0 \
+    --cutmix 0.0 \
+    --delete_head \
+    --semantic_loading True \
     --epochs 20 \
     --lr 1e-4 \
     --drop_path 0.8 \

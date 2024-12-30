@@ -330,9 +330,11 @@ class VisionMamba(nn.Module):
     def load_pretrained(self, checkpoint_path, prefix=""):
         _load_weights(self, checkpoint_path, prefix)
 
-    def forward_features(self, x, inference_params=None):
+    def forward_features(self, x, m, inference_params=None):
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
+        # print("SHAPE: ", B, C, T, H, W)
+        print("SHAPE: ", m.size(), type(m))
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
 
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
@@ -385,8 +387,8 @@ class VisionMamba(nn.Module):
         # return only cls token
         return hidden_states[:, 0, :]
 
-    def forward(self, x, inference_params=None):
-        x = self.forward_features(x, inference_params)
+    def forward(self, x, m, inference_params=None):
+        x = self.forward_features(x, m, inference_params)
         x = self.head(self.head_drop(x))
         return x
     
@@ -610,7 +612,7 @@ def get_args():
     parser.add_argument('--pretraining', default='COCO', type=str,
                         help='semantic dataloader pretraining type')
     
-    parser.add_argument('--test_list_path', default='', type=str,
+    parser.add_argument('--test_list_path', default='celebdf_dataset/List_of_testing_videos.txt', type=str,
                         help='semantic dataloader test split file')
     parser.add_argument('--crop_size', default=224, type=int,
                         help='semantic dataloader opt size')
@@ -660,7 +662,7 @@ def get_args():
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
-    parser.set_defaults(pin_mem=True)
+    parser.set_defaults(pin_mem=False)
     parser.add_argument('--no_amp', action='store_true')
     parser.set_defaults(no_amp=False)
 
@@ -1143,7 +1145,8 @@ def main(args, ds_init):
         pin_memory=args.pin_mem,
         drop_last=True,
         collate_fn=collate_func,
-        persistent_workers=True
+        persistent_workers=True,
+        multiprocessing_context='spawn'
     )
 
     if dataset_val is not None:
@@ -1153,7 +1156,8 @@ def main(args, ds_init):
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn'
         )
     else:
         data_loader_val = None
@@ -1165,7 +1169,8 @@ def main(args, ds_init):
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn'
         )
     else:
         data_loader_test = None

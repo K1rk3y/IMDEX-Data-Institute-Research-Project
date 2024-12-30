@@ -12,9 +12,9 @@ import utils
 from scipy.special import softmax
 
 
-def train_class_batch(model, samples, target, criterion):
-    outputs = model(samples)
-    print("MODEL OPT: ", outputs, " TARGET: ", target)
+def train_class_batch(model, samples, target, criterion, mappings):
+    outputs = model(samples, mappings)
+    # print("MODEL OPT: ", outputs, " TARGET: ", target)
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -46,7 +46,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets, _, mappings) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -188,12 +188,15 @@ def train_one_epoch_no_dist(model: torch.nn.Module, criterion: torch.nn.Module,
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets, _, mappings) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
         it = start_steps + step  # global training iteration
-        
+
+        print("MAPPING NUM: ", len(mappings), "SAMPLE NUM: ", len(samples))
+        # assert len(mappings) == len(samples)
+
         # Update LR & WD for the first acc
         if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
             for i, param_group in enumerate(optimizer.param_groups):
@@ -215,11 +218,11 @@ def train_one_epoch_no_dist(model: torch.nn.Module, criterion: torch.nn.Module,
             if not no_amp:
                 samples = samples.bfloat16() if bf16 else samples.half()
             loss, output = train_class_batch(
-                model, samples, targets, criterion)
+                model, samples, targets, criterion, mappings)
         else:
             with amp_autocast:
                 loss, output = train_class_batch(
-                    model, samples, targets, criterion)
+                    model, samples, targets, criterion, mappings)
 
         loss_value = loss.item()
 
