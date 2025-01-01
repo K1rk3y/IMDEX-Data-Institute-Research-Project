@@ -19,7 +19,7 @@ from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValu
 from utilities.build import build_dataset
 from engine_for_finetuning import train_one_epoch, train_one_epoch_no_dist, validation_one_epoch, validation_one_epoch_no_dist, final_test, final_test_no_dist, merge
 from utils import NativeScalerWithGradNormCount as NativeScaler
-from utils import multiple_samples_collate
+from utils import multiple_samples_collate, def_collate
 import utils
 import contextlib
 import argparse
@@ -334,7 +334,8 @@ class VisionMamba(nn.Module):
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
         # print("SHAPE: ", B, C, T, H, W)
-        print("SHAPE: ", m.size(), type(m))
+        print("m SHAPE: ", len(m))
+        # print(m[0])
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
 
         cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
@@ -561,8 +562,8 @@ def get_args():
     parser.add_argument('--test_num_crop', type=int, default=3)
     
     # Random Erase params
-    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
-                        help='Random erase prob (default: 0.25)')
+    parser.add_argument('--reprob', type=float, default=0.0, metavar='PCT',
+                        help='Random erase prob (default: 0)')
     parser.add_argument('--remode', type=str, default='pixel',
                         help='Random erase mode (default: "pixel")')
     parser.add_argument('--recount', type=int, default=1,
@@ -600,7 +601,7 @@ def get_args():
 
     # Dataset parameters
     parser.add_argument('--dataset', default='celebdf', type=str,
-                        help='dataset path')
+                        help='dataset name')
     parser.add_argument('--data_path', default='you_data_path', type=str,
                         help='dataset path')
     parser.add_argument('--eval_data_path', default=None, type=str,
@@ -695,54 +696,7 @@ def get_args():
 
 
 def class_pixel_loader(args, mode):
-    if args.deeplabv2:
-        if args.pretraining == 'COCO': # coco and imagenet resnet architectures differ a little, just on how to do the stride
-            from utilities.deeplabv2 import Res_Deeplab
-        else: # imagenet pretrained (more modern modification)
-            from utilities.deeplabv2_imagenet import Res_Deeplab
-
-        # load pretrained parameters
-        if args.pretraining == 'COCO':
-            saved_state_dict = model_zoo.load_url('http://vllab1.ucmerced.edu/~whung/adv-semi-seg/resnet101COCO-41f33a49.pth') # COCO pretraining
-        else:
-            saved_state_dict = model_zoo.load_url('https://download.pytorch.org/models/resnet101-5d3b4d8f.pth') # imagenet pretrainning
-
-    else:
-        from utilities.deeplabv3 import Res_Deeplab50 as Res_Deeplab
-        saved_state_dict = model_zoo.load_url('https://download.pytorch.org/models/resnet50-19c8e357.pth') # imagenet pretrainning
-
-    # create network
-    model = Res_Deeplab(num_classes=args.loader_classes)
-
-    # Copy loaded parameters to model
-    new_params = model.state_dict().copy()
-    for name, param in new_params.items():
-        if name in saved_state_dict and param.size() == saved_state_dict[name].size():
-            new_params[name].copy_(saved_state_dict[name])
-    model.load_state_dict(new_params)
-
-    checkpoint = torch.load(os.path.join(args.checkpoint_dir, f'best_model.pth'))
-    model.load_state_dict(checkpoint['model'])
-    model = model.cuda()
-
-    model.eval()
-    
-    # Set up normalization based on pretraining
-    if args.pretraining == 'COCO':
-        from utilities.transformsgpu import normalize_bgr as normalize
-    else:
-        from utilities.transformsgpu import normalize_rgb as normalize
-
-    # Set up dataset
-    if args.dataset == 'celebdf':
-        test_dataset = CelebDFDataSet(root_path=args.data_path, test_list_path=args.test_list_path, mode=mode, clip_len=args.num_frames, frame_sample_rate=args.sampling_rate, crop_size=args.crop_size, semantic_loading=args.semantic_loading, model=model, normalize=normalize, args=args)
-
-        print(test_dataset[0][0].size())
-
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-        
-    return test_dataset
+    return CelebDFDataSet(root_path=args.data_path, test_list_path=args.test_list_path, mode=mode, clip_len=args.num_frames, frame_sample_rate=args.sampling_rate, crop_size=args.crop_size, semantic_loading=args.semantic_loading, args=args)
 
 
 def freeze_layers(model, num_layers_to_freeze=None):
@@ -1078,7 +1032,7 @@ def main(args, ds_init):
     if ds_init is not None:
         utils.create_ds_config(args)
 
-    print(args)
+    # print(args)
 
     device = torch.device(args.device)
 
@@ -1089,100 +1043,6 @@ def main(args, ds_init):
     # random.seed(seed)
 
     cudnn.benchmark = True
-
-    """dataset_train, args.nb_classes = build_dataset(is_train=True, test_mode=False, args=args)
-    if args.disable_eval_during_finetuning:
-        dataset_val = None
-    else:
-        dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
-    dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)"""
-
-
-    dataset_train = class_pixel_loader(args, "train")
-    print("SIZE: ", len(dataset_train))
-    print("LABELS: ", dataset_train[0][1])
-
-    if args.disable_eval_during_finetuning:
-        dataset_val = None
-    else:
-        dataset_val = class_pixel_loader(args, "validation")
-    dataset_test = class_pixel_loader(args, "test")
-    
-
-    num_tasks = utils.get_world_size()
-    global_rank = utils.get_rank()
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    print("Sampler_train = %s" % str(sampler_train))
-    if args.dist_eval:
-        if len(dataset_val) % num_tasks != 0:
-            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                    'equal num of samples per-process.')
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        sampler_test = torch.utils.data.DistributedSampler(
-            dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    else:
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
-    if args.num_sample > 1:
-        collate_func = partial(multiple_samples_collate, fold=False)
-    else:
-        collate_func = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-        collate_fn=collate_func,
-        persistent_workers=True,
-        multiprocessing_context='spawn'
-    )
-
-    if dataset_val is not None:
-        data_loader_val = torch.utils.data.DataLoader(
-            dataset_val, sampler=sampler_val,
-            batch_size=int(1.5 * args.batch_size),
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
-        )
-    else:
-        data_loader_val = None
-
-    if dataset_test is not None:
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, sampler=sampler_test,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
-        )
-    else:
-        data_loader_test = None
-
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     if 'deit' in args.model:
         model = create_model(
@@ -1230,6 +1090,98 @@ def main(args, ds_init):
     print("Patch size = %s" % str(patch_size))
     args.window_size = (args.num_frames // args.tubelet_size, args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
+
+    """dataset_train, args.nb_classes = build_dataset(is_train=True, test_mode=False, args=args)
+    if args.disable_eval_during_finetuning:
+        dataset_val = None
+    else:
+        dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
+    dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)"""
+
+    dataset_train = class_pixel_loader(args, "train")
+
+    if args.disable_eval_during_finetuning:
+        dataset_val = None
+    else:
+        dataset_val = class_pixel_loader(args, "validation")
+    dataset_test = class_pixel_loader(args, "test")
+    
+
+    num_tasks = utils.get_world_size()
+    global_rank = utils.get_rank()
+    sampler_train = torch.utils.data.DistributedSampler(
+        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    )
+    print("Sampler_train = %s" % str(sampler_train))
+    if args.dist_eval:
+        if len(dataset_val) % num_tasks != 0:
+            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                    'equal num of samples per-process.')
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+        sampler_test = torch.utils.data.DistributedSampler(
+            dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+    else:
+        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+
+    if global_rank == 0 and args.log_dir is not None:
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
+    else:
+        log_writer = None
+
+    if args.num_sample > 1:
+        collate_func = partial(multiple_samples_collate, fold=False)
+    else:
+        collate_func = def_collate
+
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        collate_fn=collate_func,
+        persistent_workers=True,
+        multiprocessing_context='spawn'
+    )
+
+    if dataset_val is not None:
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False,
+            persistent_workers=True,
+            multiprocessing_context='spawn'
+        )
+    else:
+        data_loader_val = None
+
+    if dataset_test is not None:
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, sampler=sampler_test,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False,
+            persistent_workers=True,
+            multiprocessing_context='spawn'
+        )
+    else:
+        data_loader_test = None
+
+    mixup_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    if mixup_active:
+        print("Mixup is activated!")
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+
 
     if args.finetune:
         if args.finetune.startswith('https'):

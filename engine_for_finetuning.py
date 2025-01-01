@@ -192,10 +192,9 @@ def train_one_epoch_no_dist(model: torch.nn.Module, criterion: torch.nn.Module,
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
-        it = start_steps + step  # global training iteration
+        it = start_steps + step  # global training iteration 
 
-        print("MAPPING NUM: ", len(mappings), "SAMPLE NUM: ", len(samples))
-        # assert len(mappings) == len(samples)
+        assert len(mappings) == len(samples)
 
         # Update LR & WD for the first acc
         if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:

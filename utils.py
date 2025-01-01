@@ -676,3 +676,26 @@ def multiple_pretrain_samples_collate(batch, fold=False):
         return [process_data], mask
     else:
         return process_data, mask
+    
+
+def def_collate(batch):
+    """
+    Custom collate function for DataLoader that properly handles both tensor data and mapping dictionaries.
+    
+    Args:
+        batch: List of tuples (buffer_aug, label, index, mappings)
+    
+    Returns:
+        Tuple of (batched_buffers, batched_labels, batched_indices, batched_mappings)
+    """
+    inputs, labels, video_idx, extra_data = zip(*batch)
+
+    inputs, labels, video_idx = (
+        default_collate(inputs),
+        default_collate(labels),
+        default_collate(video_idx)
+    )
+    
+    extra_data = list(extra_data)
+    
+    return inputs, labels, video_idx, extra_data

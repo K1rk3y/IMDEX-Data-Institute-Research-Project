@@ -48,8 +48,8 @@ class Parameters:
         self.deeplabv2 = True
 
         # Training parameters
-        self.batch_size = 5
-        self.num_workers = 3
+        self.batch_size = 16
+        self.num_workers = 8
         self.optimizer = "SGD"
         self.momentum = 0.9
         self.num_iterations = 600
@@ -63,7 +63,7 @@ class Parameters:
         # Data parameters
         self.split_id = None
         self.labeled_samples = 50
-        self.input_size = (512,512)
+        self.input_size = (224,224)
         self.path = "mcfs_dataset"
         self.num_classes = 18
 
@@ -74,7 +74,7 @@ class Parameters:
         # Utility parameters
         self.save_checkpoint_every = 200
         self.checkpoint_dir = "checkpoints/Deeplab"
-        self.val_per_iter = 1000
+        self.val_per_iter = 200
         self.save_best_model = True
         self.save_teacher = True
 

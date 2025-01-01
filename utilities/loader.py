@@ -4,13 +4,78 @@ import torch
 import cv2
 
 
+def save_debug_frames(buffer, save_dir, video_idx=0, color_space='RGB'):
+    """
+    Save frames from the video buffer as RGB images with proper color space handling.
+    
+    Args:
+        buffer (torch.Tensor or numpy.ndarray): Video frames tensor of shape (C, T, H, W) or (T, C, H, W)
+        save_dir (str): Directory where frames will be saved
+        video_idx (int): Video index for naming the frames
+        color_space (str): Color space of input buffer ('RGB', 'BGR', 'GBR', etc.)
+    """
+    import os
+    import torch
+    from PIL import Image
+    import numpy as np
+    import cv2
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Convert to numpy if tensor
+    if isinstance(buffer, torch.Tensor):
+        buffer = buffer.cpu().numpy()
+    
+    # Convert to (T, C, H, W) format if needed
+    if buffer.shape[0] == 3:  # If in (C, T, H, W) format
+        buffer = np.transpose(buffer, (1, 0, 2, 3))
+    
+    # Define channel order mappings
+    channel_orders = {
+        'RGB': [0, 1, 2],
+        'BGR': [2, 1, 0],
+        'GBR': [1, 2, 0],
+        'GRB': [1, 0, 2],
+        'RBG': [0, 2, 1],
+        'BRG': [2, 0, 1]
+    }
+    
+    # Save each frame
+    for frame_idx, frame in enumerate(buffer):
+        # Convert from (C, H, W) to (H, W, C)
+        frame = np.transpose(frame, (1, 2, 0))
+        
+        # Check value range and normalize if needed
+        if frame.max() <= 1.0:
+            frame = frame * 255.0
+        
+        # Clip values to valid range
+        frame = np.clip(frame, 0, 255)
+        
+        # Convert to uint8
+        frame = frame.astype(np.uint8)
+        
+        # Save frames in different channel orders
+        for space, order in channel_orders.items():
+            reordered_frame = frame[:, :, order]
+            save_path = os.path.join(save_dir, 
+                                   f'video_{video_idx:04d}_frame_{frame_idx:04d}_{space}.jpg')
+            Image.fromarray(reordered_frame).save(save_path, quality=95)
+        
+        # Save grayscale version
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        gray_save_path = os.path.join(save_dir, 
+                                    f'video_{video_idx:04d}_frame_{frame_idx:04d}_gray.jpg')
+        Image.fromarray(gray_frame).save(gray_save_path)
+        
+
 class SeqToImagesProcessor:
     """
     Processes video buffer outputs from CelebDFDataSet into individual frames
-    using MCFSDataSet's image processing pipeline.
+    using improved image processing pipeline with proper resizing and interpolation.
     Handles both single and multiple sample cases.
     """
-    def __init__(self, crop_size=(321, 321), scale=True, mirror=True, pretraining='COCO'):
+    def __init__(self, crop_size=(224, 224), scale=False, mirror=False, pretraining='COCO'):
         """
         Args:
             crop_size (tuple): (height, width) for crop size
@@ -49,7 +114,7 @@ class SeqToImagesProcessor:
 
     def _process_single_frame(self, frame):
         """
-        Process a single frame using MCFSDataSet's pipeline.
+        Process a single frame using improved resizing pipeline.
         
         Args:
             frame: Input frame tensor (C x H x W)
@@ -65,40 +130,20 @@ class SeqToImagesProcessor:
         if frame.shape[0] == 3:  # If in CHW format
             frame = np.transpose(frame, (1, 2, 0))
 
-        # Convert BGR to RGB
-        if self.pretraining == 'COCO': # if pratraining is not COCO, change to RGB
-            frame = frame
-        else:
+        # Convert BGR to RGB if needed
+        if self.pretraining != 'COCO':
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Convert to float32
         image = np.asarray(frame, np.float32)
-        img_h, img_w = image.shape[:2]
         
-        # Apply MCFSDataSet's image processing pipeline
+        # Apply random scaling if enabled
         if self.scale:
             scale = random.uniform(0.5, 2.0)
-            image = cv2.resize(image, None, fx=scale, fy=scale, 
-                             interpolation=cv2.INTER_LINEAR)
-            img_h, img_w = image.shape[:2]
-        
-        # Padding
-        pad_h = max(self.crop_h - img_h, 0)
-        pad_w = max(self.crop_w - img_w, 0)
-        
-        if pad_h > 0 or pad_w > 0:
-            img_pad = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, 
-                                       cv2.BORDER_CONSTANT, 
-                                       value=(0.0, 0.0, 0.0))
-        else:
-            img_pad = image
-            
-        img_h, img_w = img_pad.shape[:2]
-        
-        # Random crop
-        h_off = random.randint(0, max(0, img_h - self.crop_h))
-        w_off = random.randint(0, max(0, img_w - self.crop_w))
-        image = img_pad[h_off:h_off+self.crop_h, w_off:w_off+self.crop_w].copy()
+            h, w = image.shape[:2]
+            scaled_h = int(h * scale)
+            scaled_w = int(w * scale)
+            image = cv2.resize(image, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
         
         # Random mirroring
         if self.is_mirror and random.random() < 0.5:
