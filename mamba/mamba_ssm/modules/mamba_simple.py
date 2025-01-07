@@ -31,6 +31,17 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename='debug.txt',
+    filemode='a',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+
 class Mamba(nn.Module):
     def __init__(
         self,
@@ -473,6 +484,12 @@ class MambaSL(nn.Module):
         Returns: same shape as hidden_states
         """
         batch, seqlen, dim = hidden_states.shape
+
+        logging.debug(f'Mamba Layer: hidden_states shape: {hidden_states.shape}')
+        if valid_positions is not None:
+            logging.debug(f'Mamba Layer: valid_positions shape: {valid_positions.shape}')
+            logging.debug(f'Mamba Layer: Number of valid positions: {valid_positions.sum().item()}')
+
         conv_state, ssm_state = None, None
         if inference_params is not None:
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
@@ -492,6 +509,9 @@ class MambaSL(nn.Module):
         # Fast Path and bimamba are always true as per your specification
         if self.use_fast_path and inference_params is None:
             if self.bimamba:
+
+                logging.debug('Using fast path with bimamba')
+
                 A_b = -torch.exp(self.A_b_log.float())
                 # Forward pass for the forward direction
                 out = mamba_inner_fn_no_out_proj_sl(
@@ -525,12 +545,14 @@ class MambaSL(nn.Module):
                 )
                 # Combine the outputs from both directions
                 out = F.linear(rearrange(out + out_b.flip(-1), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
+
+                logging.debug(f'Output shape after Mamba layer: {out.shape}')
+
             else:
-                # The bimamba flag is always true, so this block is not executed
-                pass
+                logging.debug('ERROR IN MAMBASL NOT BIMAMBA')
         else:
-            # This block is not executed as per your specification
-            pass
+            logging.debug('ERROR IN MAMBASL NOT FAST PATH')
+
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

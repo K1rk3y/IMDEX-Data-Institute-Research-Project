@@ -10,6 +10,16 @@ from causal_conv1d import causal_conv1d_fn
 import causal_conv1d_cuda
 import selective_scan_cuda
 
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename='debug.txt',
+    filemode='a',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 
 class SelectiveScanFn(torch.autograd.Function):
 
@@ -612,6 +622,9 @@ class MambaInnerFnNoOutProjSL(torch.autograd.Function):
                 B_proj_bias=None, C_proj_bias=None,
                 delta_softplus=True, checkpoint_lvl=1, valid_positions=None):
         """ xz: (batch_size, 2 * d_inner, seqlen) """
+
+        logging.debug(f'MambaInnerFnNoOutProj forward: xz shape: {xz.shape}')
+
         assert checkpoint_lvl in [0, 1]
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
@@ -658,6 +671,9 @@ class MambaInnerFnNoOutProjSL(torch.autograd.Function):
                 C = C + C_proj_bias.to(dtype=C.dtype)
         # Apply masks to delta, B, and C based on valid_positions
         if valid_positions is not None:
+
+            logging.debug(f'Mask applied inside custom function: valid_positions shape: {valid_positions.shape}')
+
             # Flatten valid_positions to match (batch_size * seqlen)
             valid_positions_flat = valid_positions.reshape(-1).unsqueeze(-1).to(x_dbl.dtype)  # (BL, 1)
             B = B * valid_positions_flat  # Mask B
@@ -689,6 +705,9 @@ class MambaInnerFnNoOutProjSL(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, dout):
+
+        logging.debug(f'MambaInnerFnNoOutProj backward: dout shape: {dout.shape}')
+
         # Extract saved tensors
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight,
          conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
