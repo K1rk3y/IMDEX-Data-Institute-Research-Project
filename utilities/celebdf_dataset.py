@@ -408,7 +408,7 @@ class CelebDFDataSet(Dataset):
             buffer = self.original(buffer)
          
             if self.semantic_loading:
-                save_debug_frames(buffer, "debug_frames")
+                # save_debug_frames(buffer, "debug_frames")
                 mappings = self._semantic_loading(buffer)
                 return buffer_aug, self.label_array[index], index, mappings
             

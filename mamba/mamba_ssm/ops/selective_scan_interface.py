@@ -601,6 +601,199 @@ class BiMambaInnerFn(torch.autograd.Function):
                 dA, dA_b, dB, dC, dD,
                 ddelta_bias if delta_bias is not None else None,
                 dB_proj_bias, dC_proj_bias, None)
+
+
+class MambaInnerFnNoOutProjSL(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, xz, conv1d_weight, conv1d_bias,
+                x_proj_weight, delta_proj_weight,
+                A, B=None, C=None, D=None, delta_bias=None,
+                B_proj_bias=None, C_proj_bias=None,
+                delta_softplus=True, checkpoint_lvl=1, valid_positions=None):
+        """ xz: (batch_size, 2 * d_inner, seqlen) """
+        assert checkpoint_lvl in [0, 1]
+        L = xz.shape[-1]
+        delta_rank = delta_proj_weight.shape[1]
+        d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+        if torch.is_autocast_enabled():
+            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
+            delta_proj_weight = delta_proj_weight.to(dtype=torch.get_autocast_gpu_dtype())
+        if xz.stride(-1) != 1:
+            xz = xz.contiguous()
+        # Reshape convolution weight for causal convolution
+        conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
+        # Split x and z from xz
+        x, z = xz.chunk(2, dim=1)  # Both of shape (batch_size, d_inner, seqlen)
+        # Perform causal convolution on x
+        conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
+        conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
+            x, conv1d_weight, conv1d_bias, True
+        )  # Shape: (batch_size, d_inner, seqlen)
+        # Linear projection to compute delta, B, and C
+        x_dbl = F.linear(
+            rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight
+        )  # Shape: (batch_size * seqlen, total_d_state)
+        # Compute delta
+        delta = rearrange(
+            delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l=L
+        )  # Shape: (batch_size, d_inner, seqlen)
+        # Save variables for backward
+        ctx.is_variable_B = B is None
+        ctx.is_variable_C = C is None
+        ctx.B_proj_bias_is_None = B_proj_bias is None
+        ctx.C_proj_bias_is_None = C_proj_bias is None
+        ctx.delta_softplus = delta_softplus
+        ctx.checkpoint_lvl = checkpoint_lvl
+        if valid_positions is not None:
+            ctx.valid_positions = valid_positions
+        # Compute B and C projections if they are not provided
+        if B is None:
+            B = x_dbl[:, delta_rank:delta_rank + d_state]  # (batch_size * seqlen, d_state)
+            if B_proj_bias is not None:
+                B = B + B_proj_bias.to(dtype=B.dtype)
+        if C is None:
+            C = x_dbl[:, -d_state:]  # (batch_size * seqlen, d_state)
+            if C_proj_bias is not None:
+                C = C + C_proj_bias.to(dtype=C.dtype)
+        # Apply masks to delta, B, and C based on valid_positions
+        if valid_positions is not None:
+            # Flatten valid_positions to match (batch_size * seqlen)
+            valid_positions_flat = valid_positions.reshape(-1).unsqueeze(-1).to(x_dbl.dtype)  # (BL, 1)
+            B = B * valid_positions_flat  # Mask B
+            C = C * valid_positions_flat  # Mask C
+            # Expand valid_positions for delta
+            valid_positions_expanded = valid_positions.unsqueeze(1).to(delta.dtype)  # (B, 1, L)
+            delta = delta * valid_positions_expanded  # Mask delta
+        # Reshape B and C for the SSM kernel
+        if not A.is_complex():
+            B = rearrange(B, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+            C = rearrange(C, "(b l) dstate -> b 1 dstate l", l=L).contiguous()
+        else:
+            B = rearrange(B, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
+            C = rearrange(C, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
+        if D is not None:
+            D = D.contiguous()
+        # Proceed with the SSM computation
+        out, scan_intermediates, out_z = selective_scan_cuda.fwd(
+            conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
+        )
+        # Save tensors for backward pass
+        ctx.save_for_backward(
+            xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight,
+            conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out
+        )
+        # Return the output (batch_size, d_inner, seqlen)
+        return out_z
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, dout):
+        # Extract saved tensors
+        (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight,
+         conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
+        L = xz.shape[-1]
+        delta_rank = delta_proj_weight.shape[1]
+        d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
+        x, z = xz.chunk(2, dim=1)  # (batch_size, d_inner, seqlen)
+        if dout.stride(-1) != 1:
+            dout = dout.contiguous()
+        if ctx.checkpoint_lvl == 1:
+            # Recompute conv1d_out and delta in backward pass if checkpointing
+            conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias, True)
+            x_dbl = F.linear(
+                rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight
+            )
+            delta = rearrange(
+                delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l=L
+            )
+            if hasattr(ctx, 'valid_positions'):
+                # Apply masks to x_dbl and delta
+                valid_positions_flat = ctx.valid_positions.reshape(-1).unsqueeze(-1).to(x_dbl.dtype)  # (BL, 1)
+                x_dbl = x_dbl * valid_positions_flat  # Mask x_dbl
+                valid_positions_expanded = ctx.valid_positions.unsqueeze(1).to(delta.dtype)  # (B, 1, L)
+                delta = delta * valid_positions_expanded  # Mask delta
+        # Allocate space for gradients
+        dxz = torch.empty_like(xz)  # (batch_size, 2 * d_inner, seqlen)
+        dx, dz = dxz.chunk(2, dim=1)
+        # Backward through the SSM kernel
+        dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = selective_scan_cuda.bwd(
+            conv1d_out, delta, A, B, C, D, z, delta_bias, dout, scan_intermediates, out, dz,
+            ctx.delta_softplus,
+            True  # Option to recompute out_z
+        )
+        dD = dD if D is not None else None
+        dx_dbl = torch.zeros_like(x_dbl)
+        dB_proj_bias = None
+        if ctx.is_variable_B:
+            if not A.is_complex():
+                dB_flat = rearrange(dB, "b 1 dstate l -> (b l) dstate").contiguous()
+            else:
+                dB_flat = rearrange(dB, "b 1 dstate (l two) -> (b l) (dstate two)", two=2).contiguous()
+            if ctx.B_proj_bias_is_None:
+                dB_proj_bias = None
+            else:
+                dB_proj_bias = dB_flat.sum(0)  # Sum over batch and sequence length
+            dx_dbl[:, delta_rank:delta_rank + d_state] = dB_flat  # (B * L, d_state)
+            dB = None  # As we have already used dB_flat
+        dC_proj_bias = None
+        if ctx.is_variable_C:
+            if not A.is_complex():
+                dC_flat = rearrange(dC, "b 1 dstate l -> (b l) dstate").contiguous()
+            else:
+                dC_flat = rearrange(dC, "b 1 dstate (l two) -> (b l) (dstate two)", two=2).contiguous()
+            if ctx.C_proj_bias_is_None:
+                dC_proj_bias = None
+            else:
+                dC_proj_bias = dC_flat.sum(0)
+            dx_dbl[:, -d_state:] = dC_flat  # (B * L, d_state)
+            dC = None  # As we have already used dC_flat
+        # Reshape ddelta to match (d, B*L)
+        ddelta = rearrange(ddelta, "b d l -> d (b l)")
+        # Mask gradients before computing parameter gradients
+        if hasattr(ctx, 'valid_positions'):
+            valid_positions_flat = ctx.valid_positions.reshape(-1).unsqueeze(-1).to(dx_dbl.dtype)  # (B*L, 1)
+            dx_dbl = dx_dbl * valid_positions_flat  # Mask dx_dbl
+            x_dbl = x_dbl * valid_positions_flat  # Mask x_dbl
+            valid_positions_expanded = ctx.valid_positions.unsqueeze(1).to(ddelta.dtype)  # (B, 1, L)
+            ddelta = ddelta * valid_positions_expanded.view(ddelta.shape)  # Mask ddelta
+        # Compute gradients w.r.t delta_proj_weight
+        ddelta_proj_weight = torch.einsum("dB,Br->dr", ddelta, x_dbl[:, :delta_rank])
+        # Compute gradient w.r.t x_dbl[:, :delta_rank]
+        dx_dbl[:, :delta_rank] += torch.einsum("dB,dr->Br", ddelta, delta_proj_weight)
+        # Apply masks to dconv1d_out if any
+        if hasattr(ctx, 'valid_positions'):
+            # Mask dconv1d_out
+            valid_positions_expanded = ctx.valid_positions.unsqueeze(1).to(dconv1d_out.dtype)  # (B, 1, L)
+            dconv1d_out = dconv1d_out * valid_positions_expanded
+        # Compute gradients w.r.t x_proj_weight
+        dx_proj_weight = torch.einsum("Br,Bd->rd", dx_dbl, rearrange(conv1d_out, "b d l -> (b l) d"))
+        # Accumulate gradients w.r.t conv1d_out
+        dconv1d_out_flat = rearrange(dconv1d_out, "b d l -> (b l) d")
+        dconv1d_out_flat.addmm_(dx_dbl, x_proj_weight.t())
+        dconv1d_out = rearrange(dconv1d_out_flat, "(b l) d -> b d l", b=x.shape[0], l=x.shape[-1])
+        # Backprop through conv1d
+        dx, dconv1d_weight, dconv1d_bias = causal_conv1d_cuda.causal_conv1d_bwd(
+            x, conv1d_weight, conv1d_bias, dconv1d_out, dx, True
+        )
+        dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
+        dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
+        # Return gradients
+        return (dxz, dconv1d_weight, dconv1d_bias, dx_proj_weight, ddelta_proj_weight,
+                dA, dB, dC, dD,
+                ddelta_bias if delta_bias is not None else None,
+                dB_proj_bias, dC_proj_bias, None, None, None)
+
+
+def mamba_inner_fn_no_out_proj_sl(
+    xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+    A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
+    C_proj_bias=None, delta_softplus=True, valid_positions=None
+):
+    return MambaInnerFnNoOutProjSL.apply(
+        xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+        A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus, 1, valid_positions
+    )
     
 
 def mamba_inner_fn(

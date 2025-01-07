@@ -43,7 +43,7 @@ from timm.models.layers import DropPath, to_2tuple
 from timm.models.vision_transformer import _load_weights
 import math
 
-from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba_simple import Mamba, MambaSL
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -137,7 +137,8 @@ def create_block(
     factory_kwargs = {"device": device, "dtype": dtype}
     if ssm_cfg is None:
         ssm_cfg = {}
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs)
+    # mixer_cls = partial(Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs)
+    mixer_cls = partial(MambaSL, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon)
     block = Block(
         d_model,
@@ -220,33 +221,33 @@ class PatchEmbed(nn.Module):
 
 class VisionMamba(nn.Module):
     def __init__(
-            self, 
-            img_size=224, 
-            patch_size=16, 
-            depth=24, 
-            embed_dim=192, 
-            channels=3, 
+            self,
+            img_size=224,
+            patch_size=16,
+            depth=24,
+            embed_dim=192,
+            channels=3,
             num_classes=1000,
             drop_rate=0.,
             drop_path_rate=0.1,
-            ssm_cfg=None, 
-            norm_epsilon=1e-5, 
+            ssm_cfg=None,
+            norm_epsilon=1e-5,
             initializer_cfg=None,
             fused_add_norm=True,
-            rms_norm=True, 
+            rms_norm=True,
             residual_in_fp32=True,
             bimamba=True,
             # video
-            kernel_size=1, 
-            num_frames=8, 
-            fc_drop_rate=0., 
+            kernel_size=1,
+            num_frames=8,
+            fc_drop_rate=0.,
             device=None,
             dtype=None,
             # checkpoint
             use_checkpoint=False,
             checkpoint_num=0,
         ):
-        factory_kwargs = {"device": device, "dtype": dtype} # follow MambaLMHeadModel
+        factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
@@ -254,30 +255,25 @@ class VisionMamba(nn.Module):
         self.checkpoint_num = checkpoint_num
         print(f'Use checkpoint: {use_checkpoint}')
         print(f'Checkpoint number: {checkpoint_num}')
-
-        # pretrain parameters
+        # Model parameters
         self.num_classes = num_classes
-        self.d_model = self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-
+        self.d_model = self.num_features = self.embed_dim = embed_dim
         self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, 
+            img_size=img_size, patch_size=patch_size,
             kernel_size=kernel_size,
             in_chans=channels, embed_dim=embed_dim
         )
         num_patches = self.patch_embed.num_patches
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.embed_dim))
-        self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, num_frames // kernel_size, embed_dim))
+        self.temporal_pos_embedding = nn.Parameter(torch.zeros(1, num_frames * num_patches, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
-
         self.head_drop = nn.Dropout(fc_drop_rate) if fc_drop_rate > 0 else nn.Identity()
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
-
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         inter_dpr = [0.0] + dpr
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
-        # mamba blocks
+        # Mamba layers
         self.layers = nn.ModuleList(
             [
                 create_block(
@@ -295,16 +291,14 @@ class VisionMamba(nn.Module):
                 for i in range(depth)
             ]
         )
-        
-        # output head
-        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(embed_dim, eps=norm_epsilon, **factory_kwargs)
 
-        # original init
+        # Output head
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(embed_dim, eps=norm_epsilon, **factory_kwargs)
         self.apply(segm_init_weights)
         self.head.apply(segm_init_weights)
         trunc_normal_(self.pos_embed, std=.02)
 
-        # mamba init
+        # Mamba initialization
         self.apply(
             partial(
                 _init_weights,
@@ -322,7 +316,7 @@ class VisionMamba(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {"pos_embed", "cls_token", "temporal_pos_embedding"}
-    
+
     def get_num_layers(self):
         return len(self.layers)
 
@@ -330,62 +324,120 @@ class VisionMamba(nn.Module):
     def load_pretrained(self, checkpoint_path, prefix=""):
         _load_weights(self, checkpoint_path, prefix)
 
-    def forward_features(self, x, m, inference_params=None):
-        x = self.patch_embed(x)
+    def create_valid_positions_mask(self, m, B, T, H, W):
+        """
+        Args:
+            m: List of lists containing metadata for each frame in the batch.
+              Shape: [B, T], where each element is a dict {label: [(x, y), ...]}
+            B: Batch size
+            T: Number of frames
+            H: Height in patches
+            W: Width in patches
+
+        Returns:
+            valid_positions: Boolean tensor of shape (B, T, H, W)
+        """
+        device = m[0][0].device  # Assuming m contains torch tensors
+        valid_positions = torch.zeros(B, T, H, W, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            for t in range(T):
+                frame_metadata = m[b][t]  # Dictionary {label: [(x, y), ...]}
+                if 5 in frame_metadata:
+                    coords = frame_metadata[5]  # List of (x, y) tuples
+                    for x_coord, y_coord in coords:
+                        # Ensure coordinates are within bounds
+                        if 0 <= x_coord < H and 0 <= y_coord < W:
+                            valid_positions[b, t, y_coord, x_coord] = True  # Note: x corresponds to width (W), y to height (H)
+
+        return valid_positions
+
+    def select_patches_with_masks(self, x, valid_positions):
+        """
+        Prepare video sequence with masked patches while preserving spatiotemporal ordering.
+
+        Args:
+            x: Input tensor after patch embedding (B, C, T, H, W)
+            valid_positions: Boolean mask (B, T, H, W)
+
+        Returns:
+            x_with_gaps: (B, L, D) sequence with gaps
+            valid_positions_seq: (B, L) boolean mask
+        """
         B, C, T, H, W = x.shape
-        # print("SHAPE: ", B, C, T, H, W)
-        print("m SHAPE: ", len(m))
-        # print(m[0])
-        x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
 
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_token, x), dim=1)
-        x = x + self.pos_embed
+        # Reshape to sequence form while preserving spatiotemporal order
+        x = x.permute(0, 2, 3, 4, 1)  # (B, T, H, W, C)
+        x = x.reshape(B, T * H * W, C)  # (B, L, C), L = T * H * W
 
-        # temporal pos
-        cls_tokens = x[:B, :1, :]
-        x = x[:, 1:]
-        x = rearrange(x, '(b t) n m -> (b n) t m', b=B, t=T)
-        x = x + self.temporal_pos_embedding
-        x = rearrange(x, '(b n) t m -> b (t n) m', b=B, t=T)
-        x = torch.cat((cls_tokens, x), dim=1)
+        valid_positions_seq = valid_positions.reshape(B, T * H * W)
 
-        x = self.pos_drop(x)
+        # Create sequences with gap tokens
+        gap_value = 0.0  # Set to zero to ensure D * x_t is zero at invalid positions
+        x_with_gaps = x.clone()
+        x_with_gaps[~valid_positions_seq] = gap_value
 
-        # mamba impl
-        residual = None
+        return x_with_gaps, valid_positions_seq
+
+    def forward_features(self, x, m, inference_params=None):
+        x = self.patch_embed(x)  # (B, C, T, H, W)
+        B, C, T, H, W = x.shape
+
+        # Create valid_positions mask from m
+        valid_positions = self.create_valid_positions_mask(m, B, T, H, W)  # (B, T, H, W)
+
+        # Prepare sequences with gaps
+        x_with_gaps, valid_positions_seq = self.select_patches_with_masks(x, valid_positions)  # (B, L, C), (B, L)
+        L = x_with_gaps.shape[1]  # Sequence length
+
+        # Handle CLS token
+        cls_token = self.cls_token.expand(B, -1, -1)  # (B, 1, C)
+        x_with_gaps = torch.cat((cls_token, x_with_gaps), dim=1)  # (B, L+1, C)
+        valid_positions_seq = torch.cat(
+            (torch.ones(B, 1, dtype=torch.bool, device=x.device), valid_positions_seq), dim=1
+        )  # (B, L+1)
+
+        with open("debug.txt", 'w', encoding='utf-8') as file:
+            file.write(valid_positions_seq)
+
+        # Add positional embeddings
+        x_with_gaps = x_with_gaps + self.pos_embed[:, :L+1, :]
+
+        # Add temporal position embeddings
+        num_patches = H * W
+        temporal_pos_embedding = self.temporal_pos_embedding[:, :T * num_patches, :]
+        x_temporal = x_with_gaps[:, 1:, :] + temporal_pos_embedding  # (B, L, C)
+        x_with_gaps = torch.cat((x_with_gaps[:, :1, :], x_temporal), dim=1)  # (B, L+1, C)
+
+        x = self.pos_drop(x_with_gaps)
+
+        # Mamba implementation
         hidden_states = x
         for idx, layer in enumerate(self.layers):
-            if self.use_checkpoint and idx < self.checkpoint_num:
-                hidden_states, residual = layer(
-                    hidden_states, residual, inference_params=inference_params,
-                    use_checkpoint=True
+            # Pass valid_positions_seq to layers that accept it
+            if isinstance(layer, Mamba):
+                hidden_states = layer(
+                    hidden_states,
+                    valid_positions=valid_positions_seq,
+                    inference_params=inference_params,
                 )
             else:
-                hidden_states, residual = layer(
-                    hidden_states, residual, inference_params=inference_params
-                )
+                hidden_states = layer(hidden_states, inference_params=inference_params)
 
+        # Final normalization and head
         if not self.fused_add_norm:
-            if residual is None:
-                residual = hidden_states
-            else:
-                residual = residual + self.drop_path(hidden_states)
-            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+            hidden_states = self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
         else:
-            # Set prenorm=False here since we don't need the residual
             fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
             hidden_states = fused_add_norm_fn(
-                self.drop_path(hidden_states),
+                hidden_states,
                 self.norm_f.weight,
                 self.norm_f.bias,
                 eps=self.norm_f.eps,
-                residual=residual,
-                prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
             )
 
-        # return only cls token
+        # Return CLS token
         return hidden_states[:, 0, :]
 
     def forward(self, x, m, inference_params=None):
@@ -586,7 +638,7 @@ def get_args():
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
     # Finetuning params
-    parser.add_argument('--finetune', default='', help='finetune from checkpoint')
+    parser.add_argument('--checkpoint_path', default='checkpoints/videomamba_m16_k400_f16_res224.pth', help='finetune from checkpoint')
     parser.add_argument('--delete_head', action='store_true', help='whether delete head')
     parser.add_argument('--model_key', default='model|module', type=str)
     parser.add_argument('--model_prefix', default='', type=str)
@@ -1043,22 +1095,11 @@ def main(args, ds_init):
     # random.seed(seed)
 
     cudnn.benchmark = True
-
-    if 'deit' in args.model:
-        model = create_model(
-            args.model,
-            pretrained=True,
-            num_classes=args.nb_classes,
-            fc_drop_rate=args.fc_drop_rate,
-            drop_path_rate=args.drop_path,
-            kernel_size=args.tubelet_size,
-            num_frames=args.num_frames,
-        )
-    elif 'videomamba' in args.model:
+    if 'videomamba' in args.model:
         model = create_model(
             args.model,
             img_size=args.input_size,
-            pretrained=False if args.finetune else True,
+            pretrained=False,
             num_classes=args.nb_classes,
             fc_drop_rate=args.fc_drop_rate,
             drop_path_rate=args.drop_path,
@@ -1183,133 +1224,144 @@ def main(args, ds_init):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
 
-    if args.finetune:
-        if args.finetune.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.finetune, map_location='cpu', check_hash=True)
+    checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
+
+    print("Load ckpt from %s" % args.checkpoint_path)
+    checkpoint_model = None
+    for model_key in args.model_key.split('|'):
+        if model_key in checkpoint:
+            checkpoint_model = checkpoint[model_key]
+            print("Load state_dict by model_key = %s" % model_key)
+            break
+    if checkpoint_model is None:
+        checkpoint_model = checkpoint
+
+    if 'head.weight' in checkpoint_model.keys():
+        if args.delete_head:
+            print("Removing head from pretrained checkpoint")
+            del checkpoint_model['head.weight']
+            del checkpoint_model['head.bias']
+        elif checkpoint_model['head.weight'].shape[0] == 710:
+            if args.nb_classes == 400:
+                checkpoint_model['head.weight'] = checkpoint_model['head.weight'][:args.nb_classes]
+                checkpoint_model['head.bias'] = checkpoint_model['head.bias'][:args.nb_classes]
+            elif args.nb_classes in [600, 700]:
+                # download from https://drive.google.com/drive/folders/17cJd2qopv-pEG8NSghPFjZo1UUZ6NLVm
+                map_path = f'k710/label_mixto{args.nb_classes}.json'
+                print(f'Load label map from {map_path}')
+                with open(map_path) as f:
+                    label_map = json.load(f)
+                checkpoint_model['head.weight'] = checkpoint_model['head.weight'][label_map]
+                checkpoint_model['head.bias'] = checkpoint_model['head.bias'][label_map]
+                
+    all_keys = list(checkpoint_model.keys())
+    new_dict = OrderedDict()
+    for key in all_keys:
+        if key.startswith('backbone.'):
+            new_dict[key[9:]] = checkpoint_model[key]
+        elif key.startswith('encoder.'):
+            new_dict[key[8:]] = checkpoint_model[key]
         else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
+            new_dict[key] = checkpoint_model[key]
+    checkpoint_model = new_dict
 
-        print("Load ckpt from %s" % args.finetune)
-        checkpoint_model = None
-        for model_key in args.model_key.split('|'):
-            if model_key in checkpoint:
-                checkpoint_model = checkpoint[model_key]
-                print("Load state_dict by model_key = %s" % model_key)
-                break
-        if checkpoint_model is None:
-            checkpoint_model = checkpoint
+    # interpolate position embedding
+    if 'deit' in args.model or 'videomamba' in args.model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
+        num_patches = model.patch_embed.num_patches # 
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5)
 
-        if 'head.weight' in checkpoint_model.keys():
-            if args.delete_head:
-                print("Removing head from pretrained checkpoint")
-                del checkpoint_model['head.weight']
-                del checkpoint_model['head.bias']
-            elif checkpoint_model['head.weight'].shape[0] == 710:
-                if args.nb_classes == 400:
-                    checkpoint_model['head.weight'] = checkpoint_model['head.weight'][:args.nb_classes]
-                    checkpoint_model['head.bias'] = checkpoint_model['head.bias'][:args.nb_classes]
-                elif args.nb_classes in [600, 700]:
-                    # download from https://drive.google.com/drive/folders/17cJd2qopv-pEG8NSghPFjZo1UUZ6NLVm
-                    map_path = f'k710/label_mixto{args.nb_classes}.json'
-                    print(f'Load label map from {map_path}')
-                    with open(map_path) as f:
-                        label_map = json.load(f)
-                    checkpoint_model['head.weight'] = checkpoint_model['head.weight'][label_map]
-                    checkpoint_model['head.bias'] = checkpoint_model['head.bias'][label_map]
-                    
-        all_keys = list(checkpoint_model.keys())
-        new_dict = OrderedDict()
-        for key in all_keys:
-            if key.startswith('backbone.'):
-                new_dict[key[9:]] = checkpoint_model[key]
-            elif key.startswith('encoder.'):
-                new_dict[key[8:]] = checkpoint_model[key]
-            else:
-                new_dict[key] = checkpoint_model[key]
-        checkpoint_model = new_dict
-
-        # interpolate position embedding
-        if 'deit' in args.model or 'videomamba' in args.model:
-            pos_embed_checkpoint = checkpoint_model['pos_embed']
-            embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
-            num_patches = model.patch_embed.num_patches # 
-            num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
-            orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-            # height (== width) for the new position embedding
-            new_size = int(num_patches ** 0.5)
-
-            if orig_size != new_size:
-                print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
-                extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-                # only the position tokens are interpolated
-                pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-                # B, L, C -> B, H, W, C -> B, C, H, W
-                pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-                pos_tokens = torch.nn.functional.interpolate(
-                    pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-                # B, C, H, W -> B, H, W, C ->  B, H, W, C
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_size, new_size, embedding_size) 
-                pos_tokens = pos_tokens.flatten(1, 2) # B, L, C
-                new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-                checkpoint_model['pos_embed'] = new_pos_embed
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            # B, L, C -> B, H, W, C -> B, C, H, W
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            # B, C, H, W -> B, H, W, C
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_size * new_size, embedding_size)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
             
-            # we use 8 frames for pretraining
-            temporal_pos_embed = checkpoint_model['temporal_pos_embedding']
-            orig_t_size = args.orig_t_size // model.patch_embed.tubelet_size
-            new_t_size = args.num_frames // model.patch_embed.tubelet_size
-            # height (== width) for the checkpoint position embedding
-            if orig_t_size != new_t_size:
-                print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
-                temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
-                temporal_pos_embed = torch.nn.functional.interpolate(
-                    temporal_pos_embed, size=(new_t_size,), mode='linear', align_corners=False
-                )
-                temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
-                checkpoint_model['temporal_pos_embedding'] = temporal_pos_embed
+        # Handle temporal_pos_embedding interpolation
+        print("Interpolating temporal_pos_embedding")
+        temporal_pos_embed = checkpoint_model['temporal_pos_embedding']  # [1, old_num_positions, embed_dim]
+        old_num_positions = temporal_pos_embed.shape[1]
+        embed_dim = temporal_pos_embed.shape[2]
+        num_patches = model.patch_embed.num_patches  # e.g., 196 or 784, depending on your model
+        new_num_frames = args.num_frames
+        new_num_positions = new_num_frames * num_patches  # Total positions in your modified model
 
-        elif 'pos_embed' in checkpoint_model:
-            pos_embed_checkpoint = checkpoint_model['pos_embed']
-            embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
-            num_patches = model.patch_embed.num_patches # 
-            num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
+        # Determine old_num_frames and old_num_patches
+        # Assuming old_num_patches = 1 (per frame in the checkpoint)
+        old_num_frames = old_num_positions  # Since old_num_positions = old_num_frames * old_num_patches (old_num_patches=1)
+        old_num_patches = 1
 
-            # we use 8 frames for pretraining
-            orig_t_size = args.orig_t_size // model.patch_embed.tubelet_size
-            new_t_size = args.num_frames // model.patch_embed.tubelet_size
-            # height (== width) for the checkpoint position embedding
-            orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens)//(orig_t_size)) ** 0.5)
-            # height (== width) for the new position embedding
-            new_size = int((num_patches // new_t_size) ** 0.5)
-            
-            if orig_t_size != new_t_size:
-                print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
-                tmp_pos_embed = pos_embed_checkpoint.view(1, orig_t_size, -1, embedding_size)
-                tmp_pos_embed = tmp_pos_embed.permute(0, 2, 3, 1).reshape(-1, embedding_size, orig_t_size)
-                tmp_pos_embed = torch.nn.functional.interpolate(tmp_pos_embed, size=new_t_size, mode='linear')
-                tmp_pos_embed = tmp_pos_embed.view(1, -1, embedding_size, new_t_size)
-                tmp_pos_embed = tmp_pos_embed.permute(0, 3, 1, 2).reshape(1, -1, embedding_size)
-                checkpoint_model['pos_embed'] = tmp_pos_embed
-                pos_embed_checkpoint = tmp_pos_embed
+        # Expand temporal_pos_embed to match new shape
+        temporal_pos_embed = temporal_pos_embed.view(1, old_num_frames, old_num_patches, embed_dim)
+        # Repeat the embeddings over the spatial dimension
+        temporal_pos_embed = temporal_pos_embed.repeat(1, 1, num_patches, 1)  # [1, old_num_frames, num_patches, embed_dim]
+        temporal_pos_embed = temporal_pos_embed.view(1, old_num_frames * num_patches, embed_dim)  # [1, old_num_positions, embed_dim]
+        old_num_positions = temporal_pos_embed.shape[1]
 
-            # class_token and dist_token are kept unchanged
-            if orig_size != new_size:
-                print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
-                extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-                # only the position tokens are interpolated
-                pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-                # B, L, C -> BT, H, W, C -> BT, C, H, W
-                pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
-                pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-                pos_tokens = torch.nn.functional.interpolate(
-                    pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-                # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size) 
-                pos_tokens = pos_tokens.flatten(1, 3) # B, L, C
-                new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-                checkpoint_model['pos_embed'] = new_pos_embed
+        if old_num_positions != new_num_positions:
+            print(f"Interpolating temporal_pos_embedding from {old_num_positions} to {new_num_positions}")
+            temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)  # [1, embed_dim, old_num_positions]
+            temporal_pos_embed = torch.nn.functional.interpolate(
+                temporal_pos_embed, size=(new_num_positions,), mode='linear', align_corners=False)
+            temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)  # [1, new_num_positions, embed_dim]
+            checkpoint_model['temporal_pos_embedding'] = temporal_pos_embed
+        else:
+            checkpoint_model['temporal_pos_embedding'] = temporal_pos_embed
 
-        utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+    elif 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
+        num_patches = model.patch_embed.num_patches # 
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
+
+        # we use 8 frames for pretraining
+        orig_t_size = args.orig_t_size // model.patch_embed.tubelet_size
+        new_t_size = args.num_frames // model.patch_embed.tubelet_size
+        # height (== width) for the checkpoint position embedding
+        orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens)//(orig_t_size)) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int((num_patches // new_t_size) ** 0.5)
+        
+        if orig_t_size != new_t_size:
+            print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
+            tmp_pos_embed = pos_embed_checkpoint.view(1, orig_t_size, -1, embedding_size)
+            tmp_pos_embed = tmp_pos_embed.permute(0, 2, 3, 1).reshape(-1, embedding_size, orig_t_size)
+            tmp_pos_embed = torch.nn.functional.interpolate(tmp_pos_embed, size=new_t_size, mode='linear')
+            tmp_pos_embed = tmp_pos_embed.view(1, -1, embedding_size, new_t_size)
+            tmp_pos_embed = tmp_pos_embed.permute(0, 3, 1, 2).reshape(1, -1, embedding_size)
+            checkpoint_model['pos_embed'] = tmp_pos_embed
+            pos_embed_checkpoint = tmp_pos_embed
+
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            # B, L, C -> BT, H, W, C -> BT, C, H, W
+            pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size) 
+            pos_tokens = pos_tokens.flatten(1, 3) # B, L, C
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
+
+    utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
 
     model.to(device)
 

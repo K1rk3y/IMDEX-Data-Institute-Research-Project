@@ -14,7 +14,7 @@ python training.py \
     --nb_classes 2 \
     --log_dir ${OUTPUT_DIR} \
     --output_dir ${OUTPUT_DIR} \
-    --batch_size 12 \
+    --batch_size 16 \
     --num_sample 1 \
     --input_size 224 \
     --short_side_size 224 \
