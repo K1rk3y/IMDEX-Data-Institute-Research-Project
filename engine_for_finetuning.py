@@ -354,6 +354,7 @@ def validation_one_epoch_no_dist(data_loader, model, device, amp_autocast, ds=Tr
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
         target = batch[1]
+        mappings = batch[-1]
         videos = videos.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
@@ -361,11 +362,11 @@ def validation_one_epoch_no_dist(data_loader, model, device, amp_autocast, ds=Tr
         if ds:
             if not no_amp:
                 videos = videos.bfloat16() if bf16 else videos.half()
-            output = model(videos)
+            output = model(videos, mappings)
             loss = criterion(output, target)
         else:
             with amp_autocast:
-                output = model(videos)
+                output = model(videos, mappings)
                 loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, maxk))
@@ -456,6 +457,7 @@ def final_test_no_dist(data_loader, model, device, file, amp_autocast, ds=True, 
         ids = batch[2]
         chunk_nb = batch[3]
         split_nb = batch[4]
+        mappings = batch[-1]
         videos = videos.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
@@ -465,12 +467,12 @@ def final_test_no_dist(data_loader, model, device, file, amp_autocast, ds=True, 
                 videos = videos.bfloat16() if bf16 else videos.half()
 
             # print("Video shape before model:", videos.shape)  # Should be [B, C, T, H, W]
-            output = model(videos)
+            output = model(videos, mappings)
             loss = criterion(output, target)
         else:
             with amp_autocast:
                 # print("Video shape before model:", videos.shape)  # Should be [B, C, T, H, W]
-                output = model(videos)
+                output = model(videos, mappings)
                 loss = criterion(output, target)
 
         for i in range(output.size(0)):

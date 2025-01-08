@@ -67,6 +67,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+def log_gradient_norm(name):
+    def hook(grad):
+        logging.info(f"Gradient norm of {name}: {grad.norm().item()}")
+    return hook
+
 
 class Block(nn.Module):
     def __init__(
@@ -317,6 +322,46 @@ class VisionMamba(nn.Module):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
+
+        self.register_patch_embed_hooks()
+        self.register_hooks()
+
+
+    def register_patch_embed_hooks(self):
+        for name, param in self.patch_embed.named_parameters():
+            param.register_hook(log_gradient_norm(f"patch_embed.{name}"))
+
+    def register_hooks(self):
+        # Register hooks for patch embeddings
+        self.register_patch_embed_hooks()
+        # Register hooks for positional embeddings
+        self.register_pos_embed_hooks()
+        # Register hooks for layers
+        self.register_layer_hooks()
+        # Register hooks for output head and norm layer
+        self.register_head_hooks()
+
+    def register_pos_embed_hooks(self):
+        self.pos_embed.register_hook(log_gradient_norm("pos_embed"))
+        self.temporal_pos_embedding.register_hook(log_gradient_norm("temporal_pos_embedding"))
+
+    def register_layer_hooks(self):
+        for idx, layer in enumerate(self.layers):
+            # Register hooks for the layer's parameters
+            for name, param in layer.named_parameters():
+                param.register_hook(log_gradient_norm(f"layers.{idx}.{name}"))
+            # Optionally, register hooks specifically for MambaSL
+            # Uncomment the following lines if interested
+            # mambasl = layer.mixer
+            # for name, param in mambasl.named_parameters():
+            #     param.register_hook(log_gradient_norm(f"layers.{idx}.mambasl.{name}"))
+
+    def register_head_hooks(self):
+        for name, param in self.head.named_parameters():
+            param.register_hook(log_gradient_norm(f"head.{name}"))
+        for name, param in self.norm_f.named_parameters():
+            param.register_hook(log_gradient_norm(f"norm_f.{name}"))
+
 
     def create_valid_positions_mask(self, m, B, T, H, W, device):
         """
@@ -721,7 +766,7 @@ def get_args():
     parser.add_argument('--sampling_rate', type=int, default=4)
     parser.add_argument('--trimmed', type=int, default=60)
     parser.add_argument('--time_stride', type=int, default=16)
-    parser.add_argument('--output_dir', default='',
+    parser.add_argument('--output_dir', default='checkpoints',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
                         help='path where to tensorboard log')
@@ -1051,18 +1096,25 @@ def staged_training(model, args, data_loaders, device, criterion, amp_autocast, 
                         
                     # Validation
                     if data_loaders['val'] is not None:
-                        test_stats = validation_one_epoch(
-                            data_loaders['val'], model, device, amp_autocast,
-                            ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
-                            maxk=5 if args.nb_classes >= 5 else 1
-                        )
-                        
                         if args.distributed:
+                            test_stats = validation_one_epoch(
+                                data_loaders['val'], model, device, amp_autocast,
+                                ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
+                                maxk=5 if args.nb_classes >= 5 else 2
+                            )
+                        
                             torch.distributed.barrier()
                             # Gather accuracy from all processes
                             acc1_tensor = torch.tensor(test_stats['acc1']).cuda()
                             torch.distributed.all_reduce(acc1_tensor)
                             test_stats['acc1'] = acc1_tensor.item() / torch.distributed.get_world_size()
+
+                        else:
+                            test_stats = validation_one_epoch_no_dist(
+                                data_loaders['val'], model, device, amp_autocast,
+                                ds=args.enable_deepspeed, no_amp=args.no_amp, bf16=args.bf16,
+                                maxk=5 if args.nb_classes >= 5 else 2
+                            )
                         
                         # Update best accuracy and save checkpoint
                         is_best = test_stats['acc1'] > best_acc
@@ -1072,6 +1124,10 @@ def staged_training(model, args, data_loaders, device, criterion, amp_autocast, 
                             patience_counter = 0
                             if best_acc > global_best_acc:
                                 global_best_acc = best_acc
+
+                                with open("val_debug.txt", 'a', encoding='utf-8') as file:
+                                    file.write(str(test_stats))
+
                         else:
                             patience_counter += 1
                         
@@ -1167,13 +1223,6 @@ def main(args, ds_init):
     args.window_size = (args.num_frames // args.tubelet_size, args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
 
-    """dataset_train, args.nb_classes = build_dataset(is_train=True, test_mode=False, args=args)
-    if args.disable_eval_during_finetuning:
-        dataset_val = None
-    else:
-        dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
-    dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)"""
-
     dataset_train = class_pixel_loader(args, "train")
 
     if args.disable_eval_during_finetuning:
@@ -1226,10 +1275,11 @@ def main(args, ds_init):
     if dataset_val is not None:
         data_loader_val = torch.utils.data.DataLoader(
             dataset_val, sampler=sampler_val,
-            batch_size=int(1.5 * args.batch_size),
+            batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
+            collate_fn=collate_func,
             persistent_workers=True,
             multiprocessing_context='spawn'
         )
@@ -1243,6 +1293,7 @@ def main(args, ds_init):
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
+            collate_fn=collate_func,
             persistent_workers=True,
             multiprocessing_context='spawn'
         )
