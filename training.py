@@ -232,6 +232,109 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         x = self.proj(x)
         return x
+
+
+class SpatialNeighborhoodAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+    def create_neighborhood_mask(self, H, W, device):
+        """
+        Creates an attention mask where each patch only attends to its 4 immediate neighbors
+        Args:
+            H: Height in patches
+            W: Width in patches
+            device: torch device
+        Returns:
+            mask: Boolean tensor of shape (H*W, H*W)
+        """
+        mask = torch.zeros(H * W, H * W, dtype=torch.bool, device=device)
+        
+        for i in range(H * W):
+            row = i // W
+            col = i % W
+            
+            # Up neighbor
+            if row > 0:
+                mask[i, i - W] = True
+            # Down neighbor
+            if row < H - 1:
+                mask[i, i + W] = True
+            # Left neighbor
+            if col > 0:
+                mask[i, i - 1] = True
+            # Right neighbor
+            if col < W - 1:
+                mask[i, i + 1] = True
+                
+        return mask
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (B, C, T, H, W) from Conv3d
+        Returns:
+            spatial_embedding: Tensor of shape (B, C, T, H, W)
+        """
+        B, C, T, H, W = x.shape
+        
+        # Create attention mask for 4-neighborhood connectivity
+        attn_mask = ~self.create_neighborhood_mask(H, W, x.device)
+        
+        # Reshape to (B*T, H*W, C) for attention
+        x_reshaped = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
+        
+        # Run multi-head attention
+        spatial_embedding, _ = self.attention(
+            query=x_reshaped,
+            key=x_reshaped,
+            value=x_reshaped,
+            attn_mask=attn_mask,
+            need_weights=False
+        )
+        
+        # Reshape back to original format (B, C, T, H, W)
+        spatial_embedding = spatial_embedding.reshape(B, T, H, W, C).permute(0, 4, 1, 2, 3)
+        
+        return spatial_embedding
+
+
+class PatchEmbedWithSpatialContext(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, kernel_size=1, in_chans=3, embed_dim=768):
+        super().__init__()
+        # Initialize the original PatchEmbed
+        self.patch_embed = PatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            kernel_size=kernel_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim
+        )
+        
+        self.spatial_attention = SpatialNeighborhoodAttention(
+            embed_dim=embed_dim,
+            num_heads=8,
+            dropout=0.0
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        # Get original patch embeddings using Conv3d
+        x = self.patch_embed(x)  # Shape: (B, C, T, H, W)
+        
+        # Get spatial context embeddings
+        spatial_context = self.spatial_attention(x)
+        
+        # Add spatial context to original embeddings with learnable scale
+        enhanced_embedding = x + self.gamma * spatial_context
+        
+        return enhanced_embedding
     
 
 class VisionMamba(nn.Module):
@@ -274,11 +377,21 @@ class VisionMamba(nn.Module):
         self.num_classes = num_classes
         self.d_model = self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.num_frames = num_frames  # Ensure num_frames matches checkpoint
-        self.patch_embed = PatchEmbed(
+
+        """self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size,
             kernel_size=kernel_size,
             in_chans=channels, embed_dim=embed_dim
+        )"""
+
+        self.patch_embed = PatchEmbedWithSpatialContext(
+            img_size=img_size,
+            patch_size=patch_size,
+            kernel_size=kernel_size,
+            in_chans=channels,
+            embed_dim=embed_dim
         )
+
         num_patches = self.patch_embed.num_patches  # H * W
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, self.embed_dim))
