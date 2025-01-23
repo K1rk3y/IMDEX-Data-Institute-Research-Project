@@ -26,7 +26,7 @@ from utilities.voc_dataset import VOCDataSet
 from utilities.mcfs_dataset import MCFSDataSet
 from utilities.celebdf_dataset import CelebDFDataSet
 
-from evaluateSSL import evaluate
+from utilities.evaluateSSL import evaluate
 from utilities.class_balancing import ClassBalancing
 from utilities.feature_memory import *
 
