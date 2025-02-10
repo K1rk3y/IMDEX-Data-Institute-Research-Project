@@ -1167,7 +1167,7 @@ class BertForQuestionAnswering(PreTrainedBertModel):
 import torch
 import torch.nn as nn
 from copy import deepcopy
-from layer_norm import LayerNorm, Fp32GroupNorm
+from layer_norm import LayerNorm, Fp32LayerNorm
 try:
     from collections.abc import Iterable
 except ImportError:
@@ -1362,7 +1362,7 @@ class BertAudioTextModel(PreTrainedBertModel):
             text_emb_subset = self.word_embeddings.weight.data[:512]
             
             # Initialize projection weights as transpose of text embeddings
-            self.audio_projection.weight.data.copy_(text_emb_subset)
+            self.audio_projection.weight.data.copy_(text_emb_subset.t())
             self.audio_projection.bias.data.zero_()
 
         # 4. Conv positional encoders remain with default initialization
@@ -1771,8 +1771,8 @@ class BertAudioTextModel(PreTrainedBertModel):
             text_padding_mask = padding_mask[:, :text_length]
             audio_padding_mask = padding_mask[:, text_length:text_length+audio_length] if audio_input is not None else None
         else:
-            text_padding_mask = None
-            audio_padding_mask = None
+            print("Must provide valid padding masks")
+            return
 
         # Handle text token types
         if text_token_type is None:
@@ -1894,12 +1894,6 @@ class BertAudioTextModel(PreTrainedBertModel):
                 t.size(1),
                 padding_count=padding_count,
             )
-
-
-        if not is_xla_tensor(x):
-            # tpu-comment: reducing the size in a dynamic way causes
-            # too many recompilations on xla.
-            x = x[mask_indices_audio].view(x.size(0), -1, x.size(-1))
 
         if self.target_glu:
             y = self.target_glu(y)
@@ -2612,3 +2606,51 @@ def index_put(tensor, indices, value):
     else:
         tensor[indices] = value
     return tensor
+
+
+def buffered_arange(max, device="cpu"):
+    if not hasattr(buffered_arange, "buf"):
+        buffered_arange.buf = torch.LongTensor().to(device)
+    if max > buffered_arange.buf.numel():
+        buffered_arange.buf.resize_(max)
+        torch.arange(max, out=buffered_arange.buf)
+    return buffered_arange.buf[:max]
+
+
+class Fp32GroupNorm(nn.GroupNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input):
+        output = F.group_norm(
+            input.float(),
+            self.num_groups,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return output.type_as(input)
+    
+
+class GradMultiply(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        res = x.new(x)
+        return res
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+    
+
+class TransposeLast(nn.Module):
+    def __init__(self, deconstruct_idx=None, tranpose_dim=-2):
+        super().__init__()
+        self.deconstruct_idx = deconstruct_idx
+        self.tranpose_dim = tranpose_dim
+
+    def forward(self, x):
+        if self.deconstruct_idx is not None:
+            x = x[self.deconstruct_idx]
+        return x.transpose(self.tranpose_dim, -1)

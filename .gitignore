@@ -9,3 +9,5 @@ kinetics_dataset
 mcfs_dataset
 celebdf_dataset
 celebdf_dataset_slim
+AQA/components/dataloaders/gigaspeech_downloader.py
+AQA/components/datasets
