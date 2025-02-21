@@ -106,20 +106,19 @@ class Trainer(object):
         return self._lr_scheduler
 
     def _build_optimizer(self):
-        # Initialize optimizer with optional layer-wise learning rate decay
-        get_num_layer = None
-        get_layer_scale = None
-        if hasattr(self.args, 'layer_decay') and self.args.layer_decay is not None:
-            # Example for Vision Transformer models - adjust based on your model architecture
-            num_layers = len(self.model.blocks) + 1  # +1 for patch_embed/pos_embed
-            layer_decay_values = [self.args.layer_decay ** (num_layers - i) for i in range(num_layers + 1)]
-            assigner = LayerDecayValueAssigner(layer_decay_values)
-            get_num_layer = assigner.get_layer_id
-            get_layer_scale = assigner.get_scale
+        # Calculate total layers correctly
+        encoder_layers = len(self.model.encoder.layer)
+        num_layers = encoder_layers + 2  # +2 for embeddings & final layers
+        
+        layer_decay_values = [self.cfg.layer_decay ** (num_layers - i) 
+                            for i in range(num_layers)]
+        assigner = LayerDecayValueAssigner(layer_decay_values)
+        get_num_layer = assigner.get_layer_id
+        get_layer_scale = assigner.get_scale
 
-        # Create optimizer using the provided utility function
+        # Create optimizer with corrected layers
         self._optimizer = create_optimizer(
-            args=self.args,
+            args=self.cfg,
             model=self.model,
             criterion=self.criterion,
             get_num_layer=get_num_layer,
@@ -130,7 +129,7 @@ class Trainer(object):
 
         # Initialize learning rate scheduler (example using timm's scheduler)
         from timm.scheduler import create_scheduler
-        self._lr_scheduler, _ = create_scheduler(self.args, self.optimizer)
+        self._lr_scheduler, _ = create_scheduler(self.cfg, self.optimizer)
         
         # Initialize scheduler step for iteration-based updates
         self._lr_scheduler.step_update(0)

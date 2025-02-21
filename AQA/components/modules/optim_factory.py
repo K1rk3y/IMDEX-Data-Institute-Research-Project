@@ -22,28 +22,49 @@ except ImportError:
     has_apex = False
 
 
-def get_num_layer_for_vit(var_name, num_max_layer):
-    if var_name in ("cls_token", "mask_token", "pos_embed"):
+def get_num_layer_for_aqa(var_name, num_max_layer):
+    parts = var_name.split('.')
+    
+    # Initial components (embeddings, projections, conv pos)
+    if any(parts[0] in {
+        "word_embeddings", "text_token_type", "audio_token_type",
+        "position_embeddings", "text_position_embeddings",
+        "audio_position_embeddings", "feature_extractor",
+        "post_extract_proj", "audio_projection", "text_conv_pos",
+        "audio_conv_pos", "mask_emb", "mask_emb_text",
+        "quantizer", "input_quantizer", "project_q", "project_inp"
+    }):
         return 0
-    elif var_name.startswith("patch_embed"):
-        return 0
-    elif var_name.startswith("rel_pos_bias"):
+    
+    # Main encoder layers (shift by +1 to start at layer 1)
+    if parts[0] == "encoder" and len(parts) >= 3 and parts[1] == "layer":
+        try:
+            layer_id = int(parts[2]) + 1  # Shift encoder layers
+            return min(layer_id, num_max_layer - 1)
+        except ValueError:
+            return num_max_layer - 1
+    
+    # Final components (projections, pooler)
+    if any(parts[0] in {"final_proj_text", "final_proj_audio", "pooler", "target_glu"}):
         return num_max_layer - 1
-    elif var_name.startswith("blocks"):
-        layer_id = int(var_name.split('.')[1])
-        return layer_id + 1
-    elif var_name.startswith("transformer.resblocks"):
-        layer_id = int(var_name.split('.')[2])
-        return layer_id + 1
-    # elif var_name.startswith("layers"): # for VideoMamba
-    #     layer_id = int(var_name.split('.')[1])
-    #     return layer_id + 1
-    elif var_name in ("class_embedding", "positional_embedding", "temporal_positional_embedding"):
+    
+    # LayerNorm/dropout in encoder layers (shift by +1)
+    if "LayerNorm" in parts or "dropout" in parts:
+        if "encoder.layer" in var_name:
+            try:
+                layer_pos = parts.index("layer")
+                layer_id = int(parts[layer_pos + 1]) + 1  # Shift
+                return min(layer_id, num_max_layer - 1)
+            except (ValueError, IndexError):
+                pass
         return 0
-    elif var_name.startswith("conv1"):
-        return 0
-    else:
+    
+    # Additional layer (bypass)
+    if parts[0] == "additional_layer":
         return num_max_layer - 1
+    
+    # Default to last layer
+    return num_max_layer - 1
 
 
 class LayerDecayValueAssigner(object):
@@ -54,7 +75,7 @@ class LayerDecayValueAssigner(object):
         return self.values[layer_id]
 
     def get_layer_id(self, var_name):
-        return get_num_layer_for_vit(var_name, len(self.values))
+        return get_num_layer_for_aqa(var_name, len(self.values))
 
 
 def get_parameter_groups(
